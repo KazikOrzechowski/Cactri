@@ -1,0 +1,24 @@
+{
+  "version": "0.1.0",
+  "stage": "behavior-preserving refactor",
+  "unit_tests": {
+    "passed": 23,
+    "failed": 0
+  },
+  "algorithmic_identity": {
+    "synthetic_seeded_tree_chain": true,
+    "synthetic_seeded_omega_chain": true,
+    "real_K4B_tree_chain": true,
+    "real_K4B_omega_chain": true,
+    "numba_hidden_rng": false
+  },
+  "real_data_smoke": {
+    "dataset": "K4B lv=2 inc=0 ref=0.01 msp=0.01",
+    "cells": 300,
+    "snvs": 126,
+    "tree_completed": true,
+    "omega_completed": true,
+    "bcr_initializer_completed": true
+  },
+  "wheel_built": true
+}
