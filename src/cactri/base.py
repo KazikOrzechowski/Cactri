@@ -7,9 +7,14 @@ from typing import Any, Literal, Mapping
 import numpy as np
 
 from ._numba_accelerator import Accelerator, Backend
-from .config import TrackingConfig
+from .config import SplitMergeConfig, TrackingConfig
 from .state import StateView
 from .utils.assignments import InitSpec, initialize_assignments, reindex_assignments
+from .utils.posterior import (
+    cell_clone_probabilities_from_trace,
+    coassignment_probabilities_from_trace,
+    coherent_cell_genotype_probabilities,
+)
 from .utils.validation import (
     coerce_sequences,
     normalize_beta_prior,
@@ -37,7 +42,7 @@ class Cactri(ABC):
         alpha: float = 1.0,
         dirichlet_prior: float | np.ndarray = 0.5,
         p_obs_beta_prior: tuple[float, float] | np.ndarray = (50.0, 50.0),
-        p_unobs_beta_prior: tuple[float, float] = (1.0, 99.0),
+        p_unobs_beta_prior: tuple[float, float] = (1.0, 999.0),
         p_obs_init: float | np.ndarray | None = None,
         p_unobs_init: float | None = None,
         clone_prior: np.ndarray | None = None,
@@ -114,6 +119,13 @@ class Cactri(ABC):
         self.genotype_state_trace_: list[np.ndarray] = []
         self.p_obs_by_mutation_trace_: list[np.ndarray] = []
 
+        self.split_merge_attempts_: int = 0
+        self.split_merge_accepts_: int = 0
+        self.split_attempts_: int = 0
+        self.split_accepts_: int = 0
+        self.merge_attempts_: int = 0
+        self.merge_accepts_: int = 0
+
     # ------------------------------------------------------------------
     # Public lifecycle
     # ------------------------------------------------------------------
@@ -187,6 +199,7 @@ class Cactri(ABC):
         update_genotypes: bool = True,
         update_observation_probabilities: bool = True,
         tracking: TrackingConfig | None = None,
+        split_merge_config: SplitMergeConfig | None = None,
         verbose: bool = False,
         progress_every: int = 50,
     ) -> dict[str, Any]:
@@ -203,7 +216,10 @@ class Cactri(ABC):
             if update_bcr_profiles:
                 self.bcr_profiles_ = self._sample_bcr_profiles(self.assignments_)
             if update_assignments:
-                self.assignment_sweep(assignment_sampler)
+                self.assignment_sweep(
+                    assignment_sampler,
+                    split_merge_config=split_merge_config,
+                )
             if update_genotypes:
                 self._sample_genotype_state()
                 self._update_genotype_prior_parameters()
@@ -219,14 +235,24 @@ class Cactri(ABC):
                 )
         return self.to_dict()
 
-    def assignment_sweep(self, sampler: AssignmentSampler = "approximate") -> None:
+    def assignment_sweep(
+        self,
+        sampler: AssignmentSampler = "approximate",
+        *,
+        split_merge_config: SplitMergeConfig | None = None,
+    ) -> None:
         if sampler == "approximate":
             self.approximate_assignment_sweep()
         elif sampler == "sequential":
             self.sequential_assignment_sweep()
         elif sampler == "split_merge":
-            self.sequential_assignment_sweep()
-            self.split_merge_assignment_sweep()
+            config = split_merge_config or SplitMergeConfig()
+            if config.local_sampler == "approximate":
+                self.approximate_assignment_sweep()
+            elif config.local_sampler == "sequential":
+                self.sequential_assignment_sweep()
+            for _ in range(config.proposals_per_sweep):
+                self.split_merge_assignment_sweep()
         else:  # pragma: no cover
             raise ValueError("unknown assignment sampler.")
 
@@ -341,58 +367,296 @@ class Cactri(ABC):
                 self.assignments_[cell] = choice
         self.assignments_ = reindex_assignments(self.assignments_)
         self.bcr_profiles_ = self._sample_bcr_profiles(self.assignments_)
-        self.hypercluster_to_clone_ = self._resize_hypercluster_clones(old_z, self.assignments_)
 
     def split_merge_assignment_sweep(self) -> bool:
-        """One lightweight Metropolis split-or-merge proposal.
+        """Run one collapsed mutation-informed split-or-merge proposal.
 
-        This Stage-1 implementation provides a valid global proposal while
-        preserving the approximate sampler as the default. A more elaborate
-        restricted-Gibbs split/merge kernel is reserved for Stage 2.
+        BCR profiles and hypercluster-to-clone labels are analytically
+        marginalized when the partition is scored. Split proposals use a
+        restricted Gibbs allocation whose probabilities combine the CRP size
+        term, Dirichlet-multinomial BCR evidence, and clone-marginalized
+        mutation evidence. Explicit profiles and clone labels are resampled
+        only after an accepted move.
         """
+
         self._require_prefit()
         if self.n_cells < 2:
             return False
-        first, second = self.rng.choice(self.n_cells, size=2, replace=False)
-        old_assignments = self.assignments_.copy()
-        old_profiles = self.bcr_profiles_.copy()
-        old_clones = self.hypercluster_to_clone_.copy()
-        old_score = self.log_posterior()
-        candidate = old_assignments.copy()
 
-        a, b = int(candidate[first]), int(candidate[second])
-        if a != b:
-            candidate[candidate == b] = a
-        else:
-            members = np.flatnonzero(candidate == a)
+        first, second = self.rng.choice(self.n_cells, size=2, replace=False)
+        label_first = int(self.assignments_[first])
+        label_second = int(self.assignments_[second])
+        old_assignments = self.assignments_.copy()
+        cell_clone_loglik = self._cell_clone_mut_loglikelihood()
+
+        self.split_merge_attempts_ += 1
+        if label_first == label_second:
+            self.split_attempts_ += 1
+            members = np.flatnonzero(old_assignments == label_first)
             if members.size < 2:
                 return False
-            new_label = self.n_hyperclusters
-            # Seeded, data-informed split: assign by relative BCR similarity to
-            # the two selected cells, then force the seeds apart.
-            seq_a = self.sequences_[first]
-            seq_b = self.sequences_[second]
-            for idx in members:
-                match_a = int(np.sum(self.sequences_[idx] == seq_a))
-                match_b = int(np.sum(self.sequences_[idx] == seq_b))
-                if match_b > match_a or (match_b == match_a and self.rng.random() < 0.5):
-                    candidate[idx] = new_label
-            candidate[first] = a
-            candidate[second] = new_label
-            if not np.any(candidate == a) or not np.any(candidate == new_label):
-                return False
+            remaining = members[(members != first) & (members != second)]
+            order = self.rng.permutation(remaining)
+            group_a, group_b, log_q_forward = self._restricted_split_allocation(
+                first,
+                second,
+                order,
+                cell_clone_loglik=cell_clone_loglik,
+            )
+            candidate = old_assignments.copy()
+            new_label = int(old_assignments.max()) + 1
+            candidate[group_a] = label_first
+            candidate[group_b] = new_label
+            candidate = reindex_assignments(candidate)
+            old_cluster_score = self._collapsed_cluster_log_score(
+                members, cell_clone_loglik=cell_clone_loglik
+            )
+            split_score = (
+                self._collapsed_cluster_log_score(
+                    group_a, cell_clone_loglik=cell_clone_loglik
+                )
+                + self._collapsed_cluster_log_score(
+                    group_b, cell_clone_loglik=cell_clone_loglik
+                )
+            )
+            log_target_ratio = (
+                math.log(self.alpha_)
+                + math.lgamma(float(group_a.size))
+                + math.lgamma(float(group_b.size))
+                - math.lgamma(float(members.size))
+                + split_score
+                - old_cluster_score
+            )
+            log_acceptance = log_target_ratio - log_q_forward
+            move = "split"
+        else:
+            self.merge_attempts_ += 1
+            members_a = np.flatnonzero(old_assignments == label_first)
+            members_b = np.flatnonzero(old_assignments == label_second)
+            remaining = np.concatenate(
+                [
+                    members_a[members_a != first],
+                    members_b[members_b != second],
+                ]
+            )
+            order = self.rng.permutation(remaining)
+            target_group = np.full(self.n_cells, -1, dtype=np.int8)
+            target_group[members_a] = 0
+            target_group[members_b] = 1
+            _, _, log_q_reverse = self._restricted_split_allocation(
+                first,
+                second,
+                order,
+                cell_clone_loglik=cell_clone_loglik,
+                target_group=target_group,
+            )
+            candidate = old_assignments.copy()
+            candidate[candidate == label_second] = label_first
+            candidate = reindex_assignments(candidate)
+            union = np.concatenate([members_a, members_b])
+            separate_score = (
+                self._collapsed_cluster_log_score(
+                    members_a, cell_clone_loglik=cell_clone_loglik
+                )
+                + self._collapsed_cluster_log_score(
+                    members_b, cell_clone_loglik=cell_clone_loglik
+                )
+            )
+            merged_score = self._collapsed_cluster_log_score(
+                union, cell_clone_loglik=cell_clone_loglik
+            )
+            log_target_ratio = (
+                -math.log(self.alpha_)
+                + math.lgamma(float(union.size))
+                - math.lgamma(float(members_a.size))
+                - math.lgamma(float(members_b.size))
+                + merged_score
+                - separate_score
+            )
+            log_acceptance = log_target_ratio + log_q_reverse
+            move = "merge"
 
-        candidate = reindex_assignments(candidate)
-        self.assignments_ = candidate
-        self.bcr_profiles_ = self._sample_bcr_profiles(candidate)
-        self.hypercluster_to_clone_ = self._resize_hypercluster_clones(old_assignments, candidate)
-        new_score = self.log_posterior()
-        accept = np.log(self.rng.random()) < min(0.0, new_score - old_score)
-        if not accept:
-            self.assignments_ = old_assignments
-            self.bcr_profiles_ = old_profiles
-            self.hypercluster_to_clone_ = old_clones
-        return bool(accept)
+        accepted = bool(np.log(self.rng.random()) < min(0.0, log_acceptance))
+        if accepted:
+            self.assignments_ = candidate
+            self.bcr_profiles_ = self._sample_bcr_profiles(candidate)
+            self.hypercluster_to_clone_ = self._sample_hypercluster_clone_assignments()
+            self.split_merge_accepts_ += 1
+            if move == "split":
+                self.split_accepts_ += 1
+            else:
+                self.merge_accepts_ += 1
+        return accepted
+
+    def split_merge_diagnostics(self) -> dict[str, float | int]:
+        """Return proposal counts and acceptance rates for global moves."""
+
+        def rate(accepted: int, attempted: int) -> float:
+            return float(accepted / attempted) if attempted else 0.0
+
+        return {
+            "attempts": self.split_merge_attempts_,
+            "accepts": self.split_merge_accepts_,
+            "acceptance_rate": rate(self.split_merge_accepts_, self.split_merge_attempts_),
+            "split_attempts": self.split_attempts_,
+            "split_accepts": self.split_accepts_,
+            "split_acceptance_rate": rate(self.split_accepts_, self.split_attempts_),
+            "merge_attempts": self.merge_attempts_,
+            "merge_accepts": self.merge_accepts_,
+            "merge_acceptance_rate": rate(self.merge_accepts_, self.merge_attempts_),
+        }
+
+    def _restricted_split_allocation(
+        self,
+        first: int,
+        second: int,
+        order: np.ndarray,
+        *,
+        cell_clone_loglik: np.ndarray,
+        target_group: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Sample or score one sequential restricted-Gibbs split allocation."""
+
+        prior = normalize_dirichlet_prior(self.dirichlet_prior, self.L)
+        prior_sum = prior.sum(axis=1)
+
+        def initial_stats(cell: int) -> tuple[np.ndarray, np.ndarray]:
+            counts = np.zeros((self.L, 4), dtype=np.int64)
+            counts[np.arange(self.L), self.sequences_[cell]] = 1
+            return counts, cell_clone_loglik[cell].copy()
+
+        group_a: list[int] = [int(first)]
+        group_b: list[int] = [int(second)]
+        counts_a, clone_sum_a = initial_stats(int(first))
+        counts_b, clone_sum_b = initial_stats(int(second))
+        log_q = 0.0
+
+        for raw_cell in order:
+            cell = int(raw_cell)
+            residues = self.sequences_[cell]
+            positions = np.arange(self.L)
+            bcr_a = np.log(
+                (counts_a[positions, residues] + prior[positions, residues])
+                / (len(group_a) + prior_sum)
+            ).sum()
+            bcr_b = np.log(
+                (counts_b[positions, residues] + prior[positions, residues])
+                / (len(group_b) + prior_sum)
+            ).sum()
+            if self.assignment_likelihood == "joint":
+                old_a = float(
+                    self._logsumexp(
+                        (clone_sum_a + self.log_clone_prior)[None, :], axis=1
+                    )[0]
+                )
+                new_a = float(
+                    self._logsumexp(
+                        (clone_sum_a + cell_clone_loglik[cell] + self.log_clone_prior)[
+                            None, :
+                        ],
+                        axis=1,
+                    )[0]
+                )
+                old_b = float(
+                    self._logsumexp(
+                        (clone_sum_b + self.log_clone_prior)[None, :], axis=1
+                    )[0]
+                )
+                new_b = float(
+                    self._logsumexp(
+                        (clone_sum_b + cell_clone_loglik[cell] + self.log_clone_prior)[
+                            None, :
+                        ],
+                        axis=1,
+                    )[0]
+                )
+                mutation_a = new_a - old_a
+                mutation_b = new_b - old_b
+            else:
+                mutation_a = mutation_b = 0.0
+
+            scores = np.asarray(
+                [
+                    math.log(len(group_a)) + float(bcr_a) + mutation_a,
+                    math.log(len(group_b)) + float(bcr_b) + mutation_b,
+                ],
+                dtype=float,
+            )
+            log_norm = float(self._logsumexp(scores[None, :], axis=1)[0])
+            if target_group is None:
+                choice = int(self._sample_rows(scores[None, :])[0])
+            else:
+                choice = int(target_group[cell])
+                if choice not in (0, 1):
+                    raise ValueError(
+                        "target_group must assign every restricted cell to group 0 or 1."
+                    )
+            log_q += float(scores[choice] - log_norm)
+            if choice == 0:
+                group_a.append(cell)
+                counts_a[positions, residues] += 1
+                clone_sum_a += cell_clone_loglik[cell]
+            else:
+                group_b.append(cell)
+                counts_b[positions, residues] += 1
+                clone_sum_b += cell_clone_loglik[cell]
+
+        return (
+            np.asarray(group_a, dtype=np.int64),
+            np.asarray(group_b, dtype=np.int64),
+            float(log_q),
+        )
+
+    def _collapsed_partition_log_target(
+        self,
+        assignments: np.ndarray,
+        *,
+        cell_clone_loglik: np.ndarray | None = None,
+    ) -> float:
+        z = reindex_assignments(np.asarray(assignments, dtype=np.int64))
+        _, counts = np.unique(z, return_counts=True)
+        score = len(counts) * math.log(self.alpha_)
+        score += math.lgamma(self.alpha_) - math.lgamma(self.alpha_ + self.n_cells)
+        score += sum(math.lgamma(float(count)) for count in counts)
+        if cell_clone_loglik is None:
+            cell_clone_loglik = self._cell_clone_mut_loglikelihood()
+        for label in range(int(z.max()) + 1):
+            members = np.flatnonzero(z == label)
+            score += self._collapsed_cluster_log_score(
+                members, cell_clone_loglik=cell_clone_loglik
+            )
+        return float(score)
+
+    def _collapsed_cluster_log_score(
+        self,
+        members: np.ndarray,
+        *,
+        cell_clone_loglik: np.ndarray,
+    ) -> float:
+        members = np.asarray(members, dtype=np.int64)
+        if members.ndim != 1 or members.size == 0:
+            raise ValueError("a collapsed cluster must contain at least one cell.")
+        score = self._collapsed_bcr_cluster_log_marginal(members)
+        if self.assignment_likelihood == "joint":
+            clone_scores = cell_clone_loglik[members].sum(axis=0) + self.log_clone_prior
+            score += float(self._logsumexp(clone_scores[None, :], axis=1)[0])
+        return float(score)
+
+    def _collapsed_bcr_cluster_log_marginal(self, members: np.ndarray) -> float:
+        prior = normalize_dirichlet_prior(self.dirichlet_prior, self.L)
+        sequences = self.sequences_[members]
+        score = 0.0
+        for position in range(self.L):
+            counts = np.bincount(sequences[:, position], minlength=4).astype(float)
+            alpha = prior[position]
+            score += math.lgamma(float(alpha.sum()))
+            score -= math.lgamma(float(alpha.sum() + counts.sum()))
+            score += sum(
+                math.lgamma(float(alpha[residue] + counts[residue]))
+                - math.lgamma(float(alpha[residue]))
+                for residue in range(4)
+            )
+        return float(score)
 
     # ------------------------------------------------------------------
     # Shared likelihoods and updates
@@ -402,7 +666,9 @@ class Cactri(ABC):
         self._require_prefit()
         return self.hypercluster_to_clone_[self.assignments_]
 
-    def posterior_cell_clone_probabilities(self) -> np.ndarray:
+    def current_state_cell_clone_probabilities(self) -> np.ndarray:
+        """Return clone probabilities conditional on the current sampler state."""
+
         self._require_prefit()
         bcr = self._cell_hypercluster_bcr_loglikelihood()
         mut = self._cell_hypercluster_mut_loglikelihood()
@@ -413,9 +679,100 @@ class Cactri(ABC):
         out = prob @ indicator
         return out / np.clip(out.sum(axis=1, keepdims=True), self.eps, None)
 
-    def posterior_cell_genotype_probabilities(self) -> np.ndarray:
-        clone_prob = self.posterior_cell_clone_probabilities()
+    def posterior_cell_clone_probabilities(
+        self,
+        *,
+        burn_in: int | float = 0,
+        thin: int = 1,
+        use_trace: bool | None = None,
+    ) -> np.ndarray:
+        """Return posterior clone probabilities.
+
+        When cell-clone draws are available, trace averaging is the default.
+        Set ``use_trace=False`` for the Stage-1 current-state calculation.
+        """
+
+        has_trace = len(self.cell_clone_assignment_trace_) > 0
+        if use_trace is True and not has_trace:
+            raise RuntimeError("cell-clone tracking is required for trace-based probabilities.")
+        if use_trace is not False and has_trace:
+            return cell_clone_probabilities_from_trace(
+                np.asarray(self.cell_clone_assignment_trace_, dtype=np.int64),
+                n_clones=self.n_clones,
+                burn_in=burn_in,
+                thin=thin,
+            )
+        return self.current_state_cell_clone_probabilities()
+
+    def current_state_cell_genotype_probabilities(self) -> np.ndarray:
+        """Return cell genotype probabilities conditional on the current state."""
+
+        clone_prob = self.current_state_cell_clone_probabilities()
         return clone_prob @ self._genotype_matrix().astype(float)
+
+    def posterior_cell_genotype_probabilities(
+        self,
+        *,
+        burn_in: int | float = 0,
+        thin: int = 1,
+        use_trace: bool | None = None,
+    ) -> np.ndarray:
+        """Return coherent posterior cell-genotype probabilities.
+
+        With compatible cell-clone and genotype traces, each draw's clone labels
+        are combined with that same draw's genotype state before averaging.
+        """
+
+        has_trace = (
+            len(self.cell_clone_assignment_trace_) > 0
+            and len(self.cell_clone_assignment_trace_) == len(self.genotype_state_trace_)
+        )
+        if use_trace is True and not has_trace:
+            raise RuntimeError(
+                "cell-clone and genotype-state tracking are required for a coherent posterior summary."
+            )
+        if use_trace is not False and has_trace:
+            return coherent_cell_genotype_probabilities(
+                np.asarray(self.cell_clone_assignment_trace_, dtype=np.int64),
+                np.asarray(self.genotype_state_trace_),
+                burn_in=burn_in,
+                thin=thin,
+            )
+        return self.current_state_cell_genotype_probabilities()
+
+    def posterior_hypercluster_coassignment(
+        self,
+        *,
+        burn_in: int | float = 0,
+        thin: int = 1,
+    ) -> np.ndarray:
+        """Return a label-invariant posterior cell co-assignment matrix."""
+
+        if not self.assignment_trace_:
+            raise RuntimeError("assignment tracking is required for co-assignment summaries.")
+        return coassignment_probabilities_from_trace(
+            self.assignment_trace_, burn_in=burn_in, thin=thin
+        )
+
+    def posterior_summary(
+        self,
+        *,
+        burn_in: int | float = 0,
+        thin: int = 1,
+    ) -> dict[str, np.ndarray]:
+        """Return canonical coherent posterior summaries from retained draws."""
+
+        return {
+            "cell_clone_probabilities": self.posterior_cell_clone_probabilities(
+                burn_in=burn_in, thin=thin, use_trace=True
+            ),
+            "cell_genotype_probabilities": self.posterior_cell_genotype_probabilities(
+                burn_in=burn_in, thin=thin, use_trace=True
+            ),
+            "hypercluster_coassignment": self.posterior_hypercluster_coassignment(
+                burn_in=burn_in, thin=thin
+            ),
+        }
 
     def log_likelihood_components(self) -> dict[str, float]:
         rows = np.arange(self.n_cells)
@@ -611,6 +968,12 @@ class Cactri(ABC):
             "p_obs_by_mutation_trace_",
         ):
             getattr(self, name).clear()
+        self.split_merge_attempts_ = 0
+        self.split_merge_accepts_ = 0
+        self.split_attempts_ = 0
+        self.split_accepts_ = 0
+        self.merge_attempts_ = 0
+        self.merge_accepts_ = 0
         self._clear_subclass_traces()
 
     def _append_tracking(self, config: TrackingConfig) -> None:
@@ -682,7 +1045,23 @@ class Cactri(ABC):
             ),
             "genotype_state_trace": np.asarray(self.genotype_state_trace_),
             "p_obs_by_mutation_trace": np.asarray(self.p_obs_by_mutation_trace_, dtype=float),
+            "split_merge_diagnostics": self.split_merge_diagnostics(),
+            "current_state_cell_clone_probabilities": self.current_state_cell_clone_probabilities(),
+            "current_state_cell_genotype_probabilities": self.current_state_cell_genotype_probabilities(),
         }
+        if self.cell_clone_assignment_trace_:
+            out["posterior_cell_clone_probabilities"] = self.posterior_cell_clone_probabilities()
+        if (
+            self.cell_clone_assignment_trace_
+            and len(self.cell_clone_assignment_trace_) == len(self.genotype_state_trace_)
+        ):
+            out["posterior_cell_genotype_probabilities"] = (
+                self.posterior_cell_genotype_probabilities()
+            )
+        if self.assignment_trace_:
+            out["posterior_hypercluster_coassignment"] = (
+                self.posterior_hypercluster_coassignment()
+            )
         out.update(self._extra_to_dict())
         return out
 

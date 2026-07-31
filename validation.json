@@ -1,24 +1,40 @@
 {
-  "version": "0.1.0",
-  "stage": "behavior-preserving refactor",
-  "unit_tests": {
-    "passed": 23,
+  "version": "0.2.0",
+  "release_stage": "Stage 2 milestone 1",
+  "tests": {
+    "passed": 31,
     "failed": 0
   },
-  "algorithmic_identity": {
-    "synthetic_seeded_tree_chain": true,
-    "synthetic_seeded_omega_chain": true,
-    "real_K4B_tree_chain": true,
-    "real_K4B_omega_chain": true,
-    "numba_hidden_rng": false
-  },
+  "wheel_clean_install": true,
+  "installed_version": "0.2.0",
+  "numpy_numba_algorithmic_identity": true,
   "real_data_smoke": {
-    "dataset": "K4B lv=2 inc=0 ref=0.01 msp=0.01",
-    "cells": 300,
-    "snvs": 126,
-    "tree_completed": true,
-    "omega_completed": true,
-    "bcr_initializer_completed": true
+    "version": "0.2.0",
+    "n_cells": 300,
+    "n_snv": 126,
+    "n_hyperclusters": 6,
+    "split_merge": {
+      "attempts": 4,
+      "accepts": 2,
+      "acceptance_rate": 0.5,
+      "split_attempts": 0,
+      "split_accepts": 0,
+      "split_acceptance_rate": 0.0,
+      "merge_attempts": 4,
+      "merge_accepts": 2,
+      "merge_acceptance_rate": 0.5
+    },
+    "posterior_genotype_shape": [
+      300,
+      126
+    ],
+    "posterior_coassignment_shape": [
+      300,
+      300
+    ],
+    "algorithmic_identity": true,
+    "elapsed_seconds": 2.511
   },
-  "wheel_built": true
+  "python_requires": ">=3.10",
+  "license": "GPL-3.0-only"
 }

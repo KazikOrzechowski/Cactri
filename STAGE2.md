@@ -1,12 +1,26 @@
-# Planned Stage 2 changes
+# Stage 2 roadmap
 
-Stage 1 focuses on refactoring and characterization. Stage 2 may introduce
-explicit model or transition-kernel changes:
+## Completed in 0.2.0
 
-- restricted-Gibbs mutation-informed split/merge proposals;
-- blocked hypercluster split plus clone reassignment moves;
+- collapsed mutation-informed restricted-Gibbs split/merge proposals;
+- blocked partition changes with clone labels marginalized and then resampled;
+- standardized absent-genotype observation prior;
+- coherent trace-based posterior genotype summaries;
+- label-invariant hypercluster co-assignment summaries;
+- split/merge diagnostics;
+- exact seeded NumPy/Numba identity tests with global moves enabled.
+
+## Planned for later 0.2.x releases
+
+- multiple restricted-Gibbs refinement scans with an auxiliary-path MH correction;
+- adaptive scheduling of split versus merge anchors;
+- cached sufficient statistics for repeated global proposals;
+- posterior partition medoid convenience methods;
+- checkpoint/resume support.
+
+## Candidate 0.3.x model extensions
+
 - topology or active-leaf uncertainty;
+- integrated clone-collapse/split moves for incomplete trees;
 - deletion and hybrid tree/independent genotype states;
-- standardized observation-prior defaults;
-- additional acceleration that preserves the documented backend identity
-  contract.
+- mutation-specific supplied-tree confidence.

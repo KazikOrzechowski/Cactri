@@ -3,7 +3,7 @@ import inspect
 import numpy as np
 import pytest
 
-from cactri import BCRInitializer, Cactri, CactriOmega, CactriTree, TrackingConfig
+from cactri import BCRInitializer, Cactri, CactriOmega, CactriTree, SplitMergeConfig, TrackingConfig
 
 
 def test_public_imports_and_abstract_base():
@@ -27,3 +27,8 @@ def test_legacy_result_aliases():
     assert np.array_equal(result["genotype_matrix"], result["mutation_profile"])
     assert np.array_equal(result["cell_clone_assignment"], result["cell_clone_assignments"])
     assert np.array_equal(model.state_.assignments, model.assignments_)
+
+
+def test_stage2_public_config():
+    assert SplitMergeConfig().proposals_per_sweep == 1
+    assert TrackingConfig.posterior().genotype_state
