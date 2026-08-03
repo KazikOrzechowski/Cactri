@@ -83,3 +83,38 @@ def coassignment_probabilities_from_trace(
         row = draws[int(idx)]
         out += row[:, None] == row[None, :]
     return out / indices.size
+
+
+
+def partition_medoid_from_trace(
+    assignment_trace: np.ndarray | list[np.ndarray],
+    *,
+    burn_in: int | float = 0,
+    thin: int = 1,
+) -> tuple[np.ndarray, int, np.ndarray]:
+    """Return the retained partition minimizing squared co-assignment loss.
+
+    The returned index refers to the original, unthinned trace. The loss is a
+    label-invariant Binder-style squared loss against the posterior
+    co-assignment matrix and is returned for every selected draw.
+    """
+
+    draws = [np.asarray(row, dtype=np.int64) for row in assignment_trace]
+    if not draws:
+        raise ValueError("assignment_trace is empty.")
+    n_cells = draws[0].size
+    if any(row.ndim != 1 or row.size != n_cells for row in draws):
+        raise ValueError("all assignment draws must be one-dimensional and equally sized.")
+    indices = _trace_indices(len(draws), burn_in=burn_in, thin=thin)
+    target = coassignment_probabilities_from_trace(
+        draws, burn_in=burn_in, thin=thin
+    )
+    losses = np.empty(indices.size, dtype=float)
+    for out_index, trace_index in enumerate(indices):
+        row = draws[int(trace_index)]
+        matrix = row[:, None] == row[None, :]
+        difference = matrix.astype(float) - target
+        losses[out_index] = float(np.sum(difference * difference))
+    selected = int(np.argmin(losses))
+    trace_index = int(indices[selected])
+    return draws[trace_index].copy(), trace_index, losses
