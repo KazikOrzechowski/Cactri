@@ -30,6 +30,7 @@ class CactriTree(Cactri):
         n_levels: int,
         tree_prior: TreePrior = "uniform",
         observed_edge_assignment: np.ndarray | None = None,
+        observed_edge_probabilities: np.ndarray | None = None,
         mutation_edge_prior: np.ndarray | None = None,
         learn_edge_error_rate: bool | None = None,
         edge_error_rate_prior: tuple[float, float] = (1.0, 19.0),
@@ -55,21 +56,46 @@ class CactriTree(Cactri):
         self.n_leaf_clones = 2**self.n_levels
         self.n_tree_vertices = 2 ** (self.n_levels + 1) - 1
         self.tree_prior = tree_prior
+        supplied_count = sum(
+            value is not None
+            for value in (
+                observed_edge_assignment,
+                observed_edge_probabilities,
+                mutation_edge_prior,
+            )
+        )
+        if supplied_count > 1:
+            raise ValueError(
+                "observed_edge_assignment, observed_edge_probabilities, and "
+                "mutation_edge_prior are mutually exclusive."
+            )
         self.observed_edge_assignment_input = (
             None
             if observed_edge_assignment is None
             else np.asarray(observed_edge_assignment, dtype=np.int64).copy()
         )
+        self.observed_edge_probabilities_input = (
+            None
+            if observed_edge_probabilities is None
+            else np.asarray(observed_edge_probabilities, dtype=float).copy()
+        )
         self.mutation_edge_prior_input = (
             None if mutation_edge_prior is None else np.asarray(mutation_edge_prior, dtype=float).copy()
         )
-        self.learn_edge_error_rate = (
+        has_observed_edges = (
             observed_edge_assignment is not None
+            or observed_edge_probabilities is not None
+        )
+        self.learn_edge_error_rate = (
+            has_observed_edges
             if learn_edge_error_rate is None
             else bool(learn_edge_error_rate)
         )
-        if self.learn_edge_error_rate and observed_edge_assignment is None:
-            raise ValueError("learn_edge_error_rate requires observed_edge_assignment.")
+        if self.learn_edge_error_rate and not has_observed_edges:
+            raise ValueError(
+                "learn_edge_error_rate requires observed_edge_assignment or "
+                "observed_edge_probabilities."
+            )
         self.edge_error_rate_prior = tuple(float(x) for x in edge_error_rate_prior)
         self.edge_error_rate_init = edge_error_rate_init
         self.distance_power = float(distance_power)
@@ -81,6 +107,9 @@ class CactriTree(Cactri):
         self._edge_transition: np.ndarray | None = None
         self._fixed_mutation_edge_prior: np.ndarray | None = None
         self.observed_edge_assignment_: np.ndarray | None = None
+        self.observed_edge_probabilities_: np.ndarray | None = None
+        self._smoothed_observed_edge_probabilities: np.ndarray | None = None
+        self.edge_error_component_trace_: list[int] = []
         self.mutation_tree_assignment_: np.ndarray | None = None
         self.mutation_profile_: np.ndarray | None = None
         self.genotype_matrix_: np.ndarray | None = None
@@ -92,6 +121,44 @@ class CactriTree(Cactri):
         super().__init__(n_clones=self.n_leaf_clones + 1, **kwargs)
         self.mutation_profile_trace_ = self.genotype_state_trace_
 
+    def _tree_distance_residual_weights(self, dominant: int) -> np.ndarray:
+        """Return an unnormalized tree-distance base over non-dominant clones."""
+
+        weights = np.zeros(self.n_clones, dtype=float)
+        first_leaf = 2**self.n_levels - 1
+
+        def node_distance(left: int, right: int) -> int:
+            ancestors: dict[int, int] = {}
+            node = left
+            distance = 0
+            while True:
+                ancestors[node] = distance
+                if node == 0:
+                    break
+                node = (node - 1) // 2
+                distance += 1
+            node = right
+            distance = 0
+            while node not in ancestors:
+                node = (node - 1) // 2
+                distance += 1
+            return distance + ancestors[node]
+
+        for clone in range(self.n_clones):
+            if clone == dominant:
+                continue
+            if clone == 0 or dominant == 0:
+                distance = self.n_levels + 1
+            else:
+                distance = node_distance(
+                    first_leaf + dominant - 1,
+                    first_leaf + clone - 1,
+                )
+            weights[clone] = math.exp(
+                -self.clone_mixture.tree_distance_decay * float(distance)
+            )
+        return weights
+
     def _make_base_edge_prior(self) -> np.ndarray:
         if self.tree_prior == "uniform":
             return np.full(self.n_tree_vertices, 1.0 / self.n_tree_vertices, dtype=float)
@@ -99,7 +166,19 @@ class CactriTree(Cactri):
         return weights / weights.sum()
 
     def _initialize_genotype_state(self) -> None:
-        if self.observed_edge_assignment_input is not None:
+        if self.observed_edge_probabilities_input is not None:
+            probabilities = self._normalize_observed_edge_probabilities(
+                self.observed_edge_probabilities_input
+            )
+            self.observed_edge_probabilities_ = probabilities
+            self._initialize_edge_transition()
+            self._smoothed_observed_edge_probabilities = (
+                probabilities @ self._edge_transition
+            )
+            self._initialize_edge_error_rate()
+            # The supplied posterior itself is the iteration-zero distribution.
+            assignment = self._sample_rows(np.log(np.clip(probabilities, self.eps, 1.0)))
+        elif self.observed_edge_assignment_input is not None:
             observed = self.observed_edge_assignment_input
             if observed.shape != (self.n_snv,):
                 raise ValueError(
@@ -108,22 +187,8 @@ class CactriTree(Cactri):
             if np.any((observed < 0) | (observed >= self.n_tree_vertices)):
                 raise ValueError("observed_edge_assignment contains an invalid vertex.")
             self.observed_edge_assignment_ = observed.copy()
-            self._edge_transition = inverse_distance_transition(
-                self.n_tree_vertices, power=self.distance_power
-            )
-            self._edge_transition *= self._base_edge_prior[None, :]
-            np.fill_diagonal(self._edge_transition, 0.0)
-            self._edge_transition /= self._edge_transition.sum(axis=1, keepdims=True)
-            if self.learn_edge_error_rate:
-                if self.edge_error_rate_init is None:
-                    a, b = self.edge_error_rate_prior
-                    self.edge_error_rate_ = float(
-                        np.clip(self.rng.beta(a, b), self.eps, 1.0 - self.eps)
-                    )
-                else:
-                    self.edge_error_rate_ = float(self.edge_error_rate_init)
-            else:
-                self.edge_error_rate_ = 1.0 - self.fixed_edge_confidence
+            self._initialize_edge_transition()
+            self._initialize_edge_error_rate()
             assignment = observed.copy()
         elif self.mutation_edge_prior_input is not None:
             self._fixed_mutation_edge_prior = self._normalize_mutation_edge_prior(
@@ -146,6 +211,47 @@ class CactriTree(Cactri):
         self.mutation_tree_assignment_ = np.asarray(assignment, dtype=np.int64)
         self._refresh_mutation_profile()
 
+    def _initialize_edge_transition(self) -> None:
+        transition = inverse_distance_transition(
+            self.n_tree_vertices, power=self.distance_power
+        )
+        transition *= self._base_edge_prior[None, :]
+        np.fill_diagonal(transition, 0.0)
+        transition /= transition.sum(axis=1, keepdims=True)
+        self._edge_transition = transition
+
+    def _initialize_edge_error_rate(self) -> None:
+        if self.learn_edge_error_rate:
+            if self.edge_error_rate_init is None:
+                a, b = self.edge_error_rate_prior
+                self.edge_error_rate_ = float(
+                    np.clip(self.rng.beta(a, b), self.eps, 1.0 - self.eps)
+                )
+            else:
+                self.edge_error_rate_ = float(self.edge_error_rate_init)
+        else:
+            self.edge_error_rate_ = 1.0 - self.fixed_edge_confidence
+
+    def _normalize_observed_edge_probabilities(
+        self, probabilities: np.ndarray
+    ) -> np.ndarray:
+        arr = np.asarray(probabilities, dtype=float)
+        if arr.shape != (self.n_snv, self.n_tree_vertices):
+            raise ValueError(
+                "observed_edge_probabilities must have shape "
+                f"({self.n_snv}, {self.n_tree_vertices})."
+            )
+        if np.any(~np.isfinite(arr)) or np.any(arr < 0):
+            raise ValueError(
+                "observed_edge_probabilities must be finite and nonnegative."
+            )
+        row_sum = arr.sum(axis=1, keepdims=True)
+        if np.any(row_sum <= 0):
+            raise ValueError(
+                "each observed_edge_probabilities row must have positive mass."
+            )
+        return arr / row_sum
+
     def _normalize_mutation_edge_prior(self, prior: np.ndarray) -> np.ndarray:
         arr = np.asarray(prior, dtype=float)
         if arr.ndim == 1:
@@ -165,6 +271,14 @@ class CactriTree(Cactri):
         raise ValueError("mutation_edge_prior must be a vector or matrix.")
 
     def _current_edge_prior(self) -> np.ndarray:
+        if self.observed_edge_probabilities_ is not None:
+            rate = float(np.clip(self.edge_error_rate_, self.eps, 1.0 - self.eps))
+            probabilities = (
+                (1.0 - rate) * self.observed_edge_probabilities_
+                + rate * self._smoothed_observed_edge_probabilities
+            )
+            probabilities = np.clip(probabilities, self.eps, None)
+            return probabilities / probabilities.sum(axis=1, keepdims=True)
         if self.observed_edge_assignment_ is not None:
             rate = float(np.clip(self.edge_error_rate_, self.eps, 1.0 - self.eps))
             probabilities = rate * self._edge_transition[self.observed_edge_assignment_]
@@ -213,16 +327,42 @@ class CactriTree(Cactri):
         return self.mutation_profile_
 
     def _update_genotype_prior_parameters(self) -> None:
-        if not (self.learn_edge_error_rate and self.observed_edge_assignment_ is not None):
+        if not self.learn_edge_error_rate:
             return
-        differences = int(
-            np.sum(self.mutation_tree_assignment_ != self.observed_edge_assignment_)
-        )
-        matches = int(self.n_snv - differences)
         a, b = self.edge_error_rate_prior
-        self.edge_error_rate_ = float(
-            np.clip(self.rng.beta(a + differences, b + matches), self.eps, 1.0 - self.eps)
-        )
+        if self.observed_edge_probabilities_ is not None:
+            rows = np.arange(self.n_snv)
+            assignment = self.mutation_tree_assignment_
+            direct = self.observed_edge_probabilities_[rows, assignment]
+            smoothed = self._smoothed_observed_edge_probabilities[rows, assignment]
+            rate = float(np.clip(self.edge_error_rate_, self.eps, 1.0 - self.eps))
+            denominator = (1.0 - rate) * direct + rate * smoothed
+            corrupted_probability = np.divide(
+                rate * smoothed, np.clip(denominator, self.eps, None)
+            )
+            corrupted = self.rng.random(self.n_snv) < corrupted_probability
+            n_corrupted = int(corrupted.sum())
+            self.edge_error_rate_ = float(
+                np.clip(
+                    self.rng.beta(a + n_corrupted, b + self.n_snv - n_corrupted),
+                    self.eps,
+                    1.0 - self.eps,
+                )
+            )
+            self.edge_error_component_trace_.append(n_corrupted)
+            return
+        if self.observed_edge_assignment_ is not None:
+            differences = int(
+                np.sum(self.mutation_tree_assignment_ != self.observed_edge_assignment_)
+            )
+            matches = int(self.n_snv - differences)
+            self.edge_error_rate_ = float(
+                np.clip(
+                    self.rng.beta(a + differences, b + matches),
+                    self.eps,
+                    1.0 - self.eps,
+                )
+            )
 
     def mutation_edge_assignment_log_prior(self) -> float:
         prior = self._current_edge_prior()
@@ -245,6 +385,7 @@ class CactriTree(Cactri):
 
     def _clear_subclass_traces(self) -> None:
         self.edge_error_rate_trace_.clear()
+        self.edge_error_component_trace_.clear()
         self.mutation_tree_assignment_trace_.clear()
 
     def _append_subclass_tracking(self, config) -> None:
@@ -269,6 +410,11 @@ class CactriTree(Cactri):
                 if self.observed_edge_assignment_ is None
                 else self.observed_edge_assignment_.copy()
             ),
+            "observed_edge_probabilities": (
+                None
+                if self.observed_edge_probabilities_ is None
+                else self.observed_edge_probabilities_.copy()
+            ),
             "edge_error_rate": (
                 None if self.edge_error_rate_ is None else float(self.edge_error_rate_)
             ),
@@ -277,6 +423,9 @@ class CactriTree(Cactri):
             "distance_power": self.distance_power,
             "edge_error_rate_trace": np.asarray(
                 self.edge_error_rate_trace_, dtype=float
+            ),
+            "edge_error_component_trace": np.asarray(
+                self.edge_error_component_trace_, dtype=np.int64
             ),
             "mutation_tree_assignment_trace": np.asarray(
                 self.mutation_tree_assignment_trace_, dtype=np.int64

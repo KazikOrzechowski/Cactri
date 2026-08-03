@@ -1,40 +1,9 @@
 {
-  "version": "0.2.0",
-  "release_stage": "Stage 2 milestone 1",
-  "tests": {
-    "passed": 31,
-    "failed": 0
-  },
-  "wheel_clean_install": true,
-  "installed_version": "0.2.0",
-  "numpy_numba_algorithmic_identity": true,
-  "real_data_smoke": {
-    "version": "0.2.0",
-    "n_cells": 300,
-    "n_snv": 126,
-    "n_hyperclusters": 6,
-    "split_merge": {
-      "attempts": 4,
-      "accepts": 2,
-      "acceptance_rate": 0.5,
-      "split_attempts": 0,
-      "split_accepts": 0,
-      "split_acceptance_rate": 0.0,
-      "merge_attempts": 4,
-      "merge_accepts": 2,
-      "merge_acceptance_rate": 0.5
-    },
-    "posterior_genotype_shape": [
-      300,
-      126
-    ],
-    "posterior_coassignment_shape": [
-      300,
-      300
-    ],
-    "algorithmic_identity": true,
-    "elapsed_seconds": 2.511
-  },
-  "python_requires": ">=3.10",
-  "license": "GPL-3.0-only"
+  "version": "0.4.1",
+  "tests_passed": 61,
+  "status": "technical validation passed; statistical benchmark incomplete",
+  "fixes": [
+    "lazy coassignment output",
+    "strictly positive active residual simplex"
+  ]
 }

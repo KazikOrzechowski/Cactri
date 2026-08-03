@@ -3,7 +3,7 @@ import inspect
 import numpy as np
 import pytest
 
-from cactri import BCRInitializer, Cactri, CactriOmega, CactriTree, SplitMergeConfig, TrackingConfig
+from cactri import BCRInitializer, Cactri, CactriOmega, CactriTree, CloneMixtureConfig, SplitMergeConfig, TrackingConfig
 
 
 def test_public_imports_and_abstract_base():
@@ -11,6 +11,7 @@ def test_public_imports_and_abstract_base():
     with pytest.raises(TypeError):
         Cactri(n_clones=2)
     assert TrackingConfig().every == 1
+    assert CloneMixtureConfig().enabled is False
     assert BCRInitializer is not None
     assert CactriTree is not None
     assert CactriOmega is not None

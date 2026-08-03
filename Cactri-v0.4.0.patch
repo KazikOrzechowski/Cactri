@@ -1,0 +1,2938 @@
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/.github/workflows/tests.yml /mnt/data/Cactri-v0.4.0/.github/workflows/tests.yml
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/.github/workflows/tests.yml	2026-07-31 17:44:47.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/.github/workflows/tests.yml	2026-08-01 07:34:13.874275995 +0000
+@@ -28,4 +28,4 @@
+           python-version: "3.11"
+       - run: python -m pip install --upgrade pip
+       - run: pip install -e ".[test,numba]"
+-      - run: pytest tests/test_accelerators.py tests/test_stage2.py tests/test_stage2_021.py
++      - run: pytest tests/test_accelerators.py tests/test_stage2.py tests/test_stage2_021.py tests/test_v040_clone_mixture.py
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/ALGORITHM_IDENTITY.md /mnt/data/Cactri-v0.4.0/ALGORITHM_IDENTITY.md
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/ALGORITHM_IDENTITY.md	2026-07-31 17:43:49.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/ALGORITHM_IDENTITY.md	2026-08-01 07:33:22.138274297 +0000
+@@ -1,43 +1,38 @@
+-# NumPy/Numba algorithmic identity
++# Algorithmic identity
+ 
+-## Contract
++Cactri requires exact seeded NumPy/Numba identity.
+ 
+-Cactri targets algorithmic identity between NumPy and Numba backends:
++## RNG ownership
+ 
+-- the model's NumPy `Generator` is the only source of randomness;
+-- random uniforms and other variates are generated before backend dispatch;
+-- kernels do not own hidden RNG state;
+-- count and discrete-state kernels are expected to agree exactly;
+-- floating-point likelihood kernels use matching operation order where practical;
+-- complete seeded chains are tested for exact assignments, clone mappings,
+-  genotype states, and observation parameters.
++All random values are generated through `model.rng`, a NumPy `Generator`.
++Accelerator kernels receive explicit uniforms and never call a backend-specific
++RNG.
+ 
+-## Stage-2 global moves
++## Mixture transitions
+ 
+-The restricted-Gibbs split/merge transition is implemented in shared code. It
+-uses the same model RNG stream regardless of backend. The local approximate or
+-sequential sweep, accepted partition, conditional BCR-profile draw, clone-label
+-draw, genotype update, and observation update therefore remain exactly aligned
+-between NumPy and Numba for a fixed environment and seed.
++The following draws are backend-independent:
+ 
+-## Limits
++- cell-level clone categorical draws;
++- joint dominant/pure-admixed structure draws;
++- Beta admixture-mass draws;
++- Gamma-normalized residual Dirichlet draws;
++- global admixture-prevalence draws;
++- CRP concentration auxiliary and Gamma draws.
+ 
+-Bitwise portability across different NumPy, Numba, compiler, CPU, or BLAS
+-versions is not promised. The supported guarantee is backend identity within a
+-fixed software and hardware environment. Distributional tests remain necessary
+-for portability across environments.
++The same Python-level code owns these draws for both backends. Numba is used for
++shared BCR, grouped-count, genotype, and categorical kernels only.
+ 
+-## Caching, adaptation, and checkpoints in 0.2.1
++## Exact-zero rows
+ 
+-The cached and uncached split/merge paths compute the same sufficient
+-statistics in the same deterministic order. Cache use does not consume random
+-numbers, so the two paths produce the same seeded chain.
++Pure clone-mixture rows contain exact zeros. The score builder maps zeros to
++`-inf` with a mask. It never evaluates `log(0)`. Entropy and prior calculations
++operate only on positive entries. This policy is identical across backends.
+ 
+-Adaptive anchor scheduling is implemented in shared Python/NumPy code. Both
+-backends receive the same anchors, restricted-Gibbs uniforms, acceptance
+-uniforms, and adaptation history.
++## Characterization
+ 
+-A checkpoint stores the NumPy bit-generator state. An uninterrupted chain and a
+-save/load/resume chain therefore produce exactly the same subsequent draws.
+-The same guarantee applies when loading with the other accelerator, provided
+-the platform satisfies the numerical assumptions documented above.
++Validation includes:
++
++- exact full-chain Tree and Omega mixture identity;
++- exact checkpoint-resume identity;
++- bit-for-bit v0.2.2 behavior with mixtures disabled;
++- exact v0.2.2 checkpoint continuation under v0.4.0.
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/ARCHITECTURE.md /mnt/data/Cactri-v0.4.0/ARCHITECTURE.md
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/ARCHITECTURE.md	2026-07-31 17:43:49.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/ARCHITECTURE.md	2026-08-01 07:33:22.138274297 +0000
+@@ -1,104 +1,76 @@
+ # Architecture
+ 
+-## Shared model
++## Release lineage
+ 
+-`Cactri` is abstract. It owns:
++Cactri 0.4.0 branches from 0.2.2. The 0.3.x hybrid/blocked partition samplers
++are retained only as immutable historical artifacts.
+ 
+-- BCR sequence coercion and Dirichlet profiles;
+-- CRP cell-to-hypercluster assignments;
+-- hypercluster-to-clone assignments;
+-- approximate, sequential, and collapsed restricted-Gibbs split/merge samplers;
+-- mutation read likelihoods through a common binary genotype-matrix interface;
+-- `p_obs_by_mutation` and `p_unobs` initialization and Gibbs updates;
+-- coherent trace-based posterior summaries;
+-- tracking, validation, and legacy result aliases.
++## Public classes
+ 
+-Subclasses implement genotype state initialization, sampling, prior evaluation,
+-and optional prior-hyperparameter updates.
++- `Cactri`: abstract shared CRP/BCR, observation, clone-mixture, tracking, and
++  checkpoint implementation.
++- `CactriTree`: full-binary-tree mutation-origin genotype model.
++- `CactriOmega`: independent clone-by-mutation genotype model.
++- `BCRInitializer`: standalone BCR-only initializer and consensus fitter.
+ 
+-## Stage-2 split/merge transition
++## Shared latent state
+ 
+-For a proposed partition, the transition analytically integrates out:
++Legacy state:
+ 
+-1. BCR frequency profiles under the Dirichlet-multinomial model;
+-2. each hypercluster's clone label under the clone prior and mutation-read
+-   likelihood.
++- `assignments_`: cell to BCR hypercluster.
++- `bcr_profiles_`: hypercluster by BCR-position categorical probabilities.
++- `p_obs_by_mutation_` and `p_unobs_`.
+ 
+-A split proposal anchors two cells in separate candidate groups and assigns the
+-remaining cells with restricted Gibbs probabilities containing:
++Mixture state:
+ 
+-- the CRP group-size factor;
+-- the BCR posterior predictive probability;
+-- the clone-marginal mutation posterior predictive probability.
++- `dominant_clones_` / `hypercluster_to_clone_`: dominant clone per
++  hypercluster.
++- `cell_clone_assignments_`: cell-level mutation clone labels.
++- `hypercluster_clone_proportions_`: hypercluster by clone mixture matrix.
++- `admixture_mass_`: total residual mass per hypercluster.
++- `residual_clone_proportions_`: residual distribution conditional on not being
++  the dominant clone.
++- `mixture_active_`: pure-versus-admixed indicator.
++- `mixture_presence_rate_`: global admixture prevalence.
+ 
+-The reverse split probability is evaluated for merge proposals, yielding a
+-Metropolis-Hastings transition with an explicit proposal correction. After an
+-accepted move, explicit BCR profiles and clone labels are sampled from their
+-conditional distributions.
++When mixtures are disabled, these arrays are maintained as an exact one-hot
++view of the v0.2 state without consuming random numbers.
+ 
+-## Tree model
++## Transition order
+ 
+-`CactriTree` represents each mutation by one full-binary-tree origin vertex. A
+-supplied mutation-edge assignment enables a learned distance-aware mismatch
+-rate by default. Uniform and level-inverse base priors remain available.
++Mixture-enabled iterations use:
+ 
+-## Omega model
++1. approximate or sequential cell-to-hypercluster transition;
++2. conjugate BCR-profile refresh performed by the assignment transition;
++3. exact parallel cell-level clone sampling;
++4. collapsed pure/admixed and dominant-clone sampling;
++5. conjugate admixture-parameter sampling;
++6. Tree edge or Omega genotype update from counts aggregated by cell clone;
++7. genotype-prior hyperparameter update;
++8. observation-probability update;
++9. optional CRP concentration update.
+ 
+-`CactriOmega` samples clone-by-mutation entries independently. A supplied
+-`omega_prior` enables a learned matrix mismatch rate. `fix_reference_clone`
+-retains the previous clone-0 behavior.
++Legacy mode retains the exact 0.2.2 transition order.
+ 
+-## Acceleration and algorithmic identity
++## Partial collapsing
+ 
+-`_numba_accelerator.py` contains all optional kernels. Random values are always
+-created by the model's NumPy `Generator` and passed to the backend. Kernels do
+-not call a random-number generator. The split/merge transition is implemented
+-in shared deterministic NumPy/Python code and therefore follows the same RNG
+-stream under both backends.
++The hypercluster assignment score marginalizes over the destination clone
++mixture. Cell clone labels are then sampled conditionally. Dominant clone and
++pure/admixed structure are sampled with admixture mass and residual proportions
++integrated out. This avoids creating a new BCR component merely to explain
++mutation-clone heterogeneity.
+ 
+-## Compatibility
++## Accelerators
+ 
+-Canonical model data are ordinary attributes. `state_` is a thin compatibility
+-view, and result dictionaries retain previous aliases such as
+-`mutation_profile`, `genotype_matrix`, and `cell_clone_assignments`.
++NumPy owns the RNG. Numba kernels receive explicit uniforms and do not create
++hidden random state. Mixture-specific categorical draws use the same shared row
++sampler, preserving exact backend identity.
+ 
+-## 0.2.1 sufficient-statistic cache
++## Tracking
+ 
+-A split/merge sweep may issue several global proposals while the genotype and
+-observation states remain fixed. The cache stores:
+-
+-- the cell-by-clone mutation log-likelihood matrix;
+-- members of every current hypercluster;
+-- per-position BCR residue counts;
+-- clone-wise summed mutation log likelihoods;
+-- collapsed BCR-plus-clone cluster scores.
+-
+-A rejected proposal reuses the cache. An accepted proposal rebuilds it for the
+-new partition. Cached and uncached paths use the same scoring order and consume
+-the same random values.
+-
+-## Adaptive anchor scheduler
+-
+-The default `uniform_pair` proposal samples one unordered cell pair uniformly.
+-The optional adaptive scheduler samples a move family first and then samples an
+-anchor pair uniformly within all valid split or merge pairs. The forward and
+-reverse state-dependent anchor probabilities are included in the MH ratio.
+-
+-The scheduler updates a bounded split probability from recent split and merge
+-acceptance rates. Because fixed-step adaptation is history dependent, formal
+-posterior workflows should use `adapt_until` to freeze it after warm-up.
+-
+-## Checkpoint representation
+-
+-`save_checkpoint()` stores a trusted gzip-compressed pickle of the canonical
+-model state. The temporary split/merge cache and `state_` view are omitted and
+-reconstructed after loading. This preserves:
+-
+-- the NumPy bit-generator state;
+-- latent assignments and genotype state;
+-- observation parameters and prior-relaxation parameters;
+-- traces and diagnostics, unless trace omission is requested;
+-- adaptive scheduling state and global iteration count.
+-
+-The accelerator can be changed on loading because backend kernels do not own
+-random state.
++`TrackingConfig` controls every potentially large mixture trace independently.
++Hypercluster-level posterior summaries align each draw to the current partition
++by maximum cell overlap. Cell clone co-clustering is computed directly from
++cell-level label traces and is invariant to clone-label permutations only when
++the biological clone labels themselves are considered fixed; the coassignment
++matrix is invariant to numeric relabeling.
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/CHANGELOG.md /mnt/data/Cactri-v0.4.0/CHANGELOG.md
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/CHANGELOG.md	2026-07-31 18:44:41.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/CHANGELOG.md	2026-08-01 07:33:22.022274293 +0000
+@@ -1,5 +1,23 @@
+ # Changelog
+ 
++## 0.4.0 — 2026-08-01
++
++### Added
++
++- Opt-in dominant-clone sparse-admixture model shared by Tree and Omega.
++- Cell-level mutation clone assignments within BCR hyperclusters.
++- Exact pure-hypercluster spike and sparse Beta-Dirichlet admixture.
++- Uniform and tree-distance residual clone priors.
++- Mixture-aware posterior summaries and cell clone co-clustering.
++- Mixture-enabled CRP concentration sampling.
++- v0.1/v0.2 checkpoint migration to a pure-mixture representation.
++
++### Compatibility
++
++- The release branches directly from 0.2.2.
++- Mixtures are disabled by default and legacy seeded behavior is unchanged.
++- The 0.3.x sampler line is discontinued and its checkpoints are rejected.
++
+ All notable changes are recorded by release. Existing release directories and
+ archives are immutable; new work is published as a new semantic version.
+ 
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/CHECKPOINTS.md /mnt/data/Cactri-v0.4.0/CHECKPOINTS.md
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/CHECKPOINTS.md	2026-07-31 18:24:56.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/CHECKPOINTS.md	2026-08-01 07:33:22.138274297 +0000
+@@ -1,47 +1,47 @@
+-# Checkpoint and resume
++# Checkpoints
+ 
+-Cactri 0.2.1 checkpoints are designed for exact continuation of trusted local
+-runs.
++Cactri checkpoints are gzip-compressed Python pickles. Load only trusted files.
+ 
+-## Saving
++## Exact continuation
+ 
+-```python
+-path = model.save_checkpoint("chain.cactri.gz")
+-```
+-
+-By default, retained traces are included. To reduce checkpoint size while
+-preserving the current sampler state:
++The checkpoint contains the NumPy bit-generator state, current latent state,
++mixture parameters, traces, CRP concentration, and completed-iteration count.
++Temporary split/merge sufficient-statistic caches are excluded and rebuilt when
++needed.
+ 
+ ```python
+-model.save_checkpoint("state_only.cactri.gz", include_traces=False)
++model.save_checkpoint("chain.cactri.gz")
++resumed = CactriTree.load_checkpoint("chain.cactri.gz")
+ ```
+ 
+-## Loading
++A backend may be changed at load time without changing the seeded statistical
++chain:
+ 
+ ```python
+-from cactri import Cactri, CactriTree
+-
+-model = Cactri.load_checkpoint("chain.cactri.gz")
+-# or enforce the expected subclass
+-model = CactriTree.load_checkpoint("chain.cactri.gz")
+-```
+-
+-The backend can be changed without resetting the RNG:
+-
+-```python
+-model = CactriTree.load_checkpoint(
++resumed = CactriTree.load_checkpoint(
+     "chain.cactri.gz",
+     accelerator="numba",
+ )
+ ```
+ 
+-## Security
++## v0.1/v0.2 migration
++
++Older checkpoints contain one clone label per hypercluster. Loading under 0.4.0
++creates:
++
++```text
++dominant_clones[h] = old hypercluster_to_clone[h]
++pi[h, dominant] = 1
++cell_clone[i] = dominant_clones[z_i]
++admixture_mass[h] = 0
++mixture_active[h] = false
++```
+ 
+-The current format uses Python pickle inside gzip. Loading a malicious pickle
+-can execute arbitrary code. Only load checkpoints created by you or another
+-trusted source.
++No random values are drawn during migration. Actual v0.2.2 interrupted chains
++were validated to continue exactly to their uninterrupted v0.2.2 result.
+ 
+-## Versioning
++## v0.3.x rejection
+ 
+-The internal checkpoint format has its own integer version. Cactri rejects
+-unknown formats instead of attempting an unsafe or ambiguous migration.
++The 0.3.x line contains incompatible experimental hybrid-sampler state and is
++not an ancestor of 0.4.0. Such checkpoints are decoded only far enough to issue
++a lineage-specific `ValueError`; they are not migrated.
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/CITATION.cff /mnt/data/Cactri-v0.4.0/CITATION.cff
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/CITATION.cff	2026-07-31 17:43:34.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/CITATION.cff	2026-08-01 07:31:24.670270440 +0000
+@@ -1,7 +1,7 @@
+ cff-version: 1.2.0
+ message: "If you use Cactri, please cite this software."
+ title: "Cactri"
+-version: 0.2.1
+-date-released: 2026-07-31
++version: 0.4.0
++date-released: 2026-08-01
+ license: GPL-3.0-only
+ type: software
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/CLONE_MIXTURES.md /mnt/data/Cactri-v0.4.0/CLONE_MIXTURES.md
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/CLONE_MIXTURES.md	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/CLONE_MIXTURES.md	2026-08-01 07:32:33.030272685 +0000
+@@ -0,0 +1,134 @@
++# Dominant-clone sparse-admixture model
++
++## Motivation
++
++The v0.2 model assigns one mutation clone to each BCR hypercluster. Simulation
++experiments with cell-level clone misspecification showed that splitting a
++mutation-discordant subset into a new BCR hypercluster pays a large and usually
++prohibitive BCR marginal-likelihood penalty. Version 0.4 changes the generative
++model instead: BCR identity remains hypercluster-level, while mutation clone
++identity becomes cell-level.
++
++## Generative model
++
++For cell `i`, let `z_i` be its BCR hypercluster and `y_i` its mutation clone.
++Each hypercluster has one BCR profile `B_h` and one clone-mixture vector `pi_h`:
++
++```text
++z ~ CRP(alpha)
++B_h,l ~ Dirichlet(eta_l)
++x_i | z_i=h ~ product_l Categorical(B_h,l)
++y_i | z_i=h, pi_h ~ Categorical(pi_h)
++a_i,j | y_i, G, theta ~ Binomial(d_i,j, theta_i,j*)
++```
++
++The mutation observation probability is `p_obs_by_mutation_[j]` when clone
++`y_i` carries mutation `j`, and `p_unobs_` otherwise.
++
++## Dominant-plus-residual prior
++
++Each hypercluster has dominant clone `d_h`:
++
++```text
++d_h ~ Categorical(clone_prior)
++```
++
++When the hypercluster is admixed:
++
++```text
++epsilon_h ~ Beta(a_mix, b_mix)
++q_h,-d ~ Dirichlet(gamma * w_d)
++pi_h,d = 1 - epsilon_h
++pi_h,k = epsilon_h * q_h,k, k != d
++```
++
++The defaults are `Beta(1,19)` for total admixture and total residual Dirichlet
++concentration `gamma=0.2`. Because `gamma < 1`, residual mass is sparse and
++usually concentrates on one or a few secondary clones.
++
++With `allow_pure_hyperclusters=True`, a global admixture prevalence is added:
++
++```text
++rho_mix ~ Beta(1,9)
++s_h ~ Bernoulli(rho_mix)
++```
++
++If `s_h=0`, `pi_h` is exactly one-hot at `d_h`. If `s_h=1`, the
++Beta-Dirichlet model is used.
++
++## Exact-zero safety
++
++Pure rows are stored as exact zeros and one exact one. Categorical log scores
++are constructed with a masked transform:
++
++```text
++log(pi_h,k) = -inf  when pi_h,k = 0
++```
++
++No code evaluates `log(0)`, and zero components are excluded from entropy and
++prior-density products. A pure cluster can become admixed because the
++pure/admixed structure is updated before the next cell-clone draw; once active,
++all residual components receive positive probability.
++
++## Gibbs updates
++
++### Cell clones
++
++```text
++log p(y_i=k | ...) = log pi_z_i,k + mutation_loglikelihood_i,k + constant
++```
++
++Cells are conditionally independent and sampled in parallel.
++
++### Hypercluster assignments
++
++Mutation evidence is marginalized over the destination hypercluster mixture:
++
++```text
++mutation_score_i,h = logsumexp_k(
++    log pi_h,k + mutation_loglikelihood_i,k
++)
++```
++
++This lets a mutation-discordant cell remain in its BCR hypercluster.
++
++### Pure/admixed structure and dominant clone
++
++For every candidate dominant clone, the admixture mass and residual proportions
++are integrated out using Beta-binomial and Dirichlet-multinomial terms. Pure and
++admixed candidate states are sampled jointly. A pure state is valid only when
++all current cell-clone labels in that hypercluster equal its candidate dominant
++clone.
++
++### Mixture parameters
++
++Conditional on an active state:
++
++```text
++epsilon_h | ... ~ Beta(a_mix + n_residual, b_mix + n_dominant)
++q_h,-d | ... ~ Dirichlet(gamma * w_d + n_h,-d)
++```
++
++### Genotypes and observation probabilities
++
++Tree edges or Omega genotypes, `p_obs_by_mutation_`, and `p_unobs_` aggregate
++mutation reads by sampled cell-level clone labels `y_i`.
++
++### CRP concentration
++
++When enabled, `alpha` uses the Escobar-West auxiliary-variable Gamma-mixture
++update. It defaults on for the mixture model and off for legacy mode.
++
++## Residual bases
++
++- `uniform`: equal prior mass over every non-dominant clone; default.
++- `tree_distance`: `CactriTree` weights clones by `exp(-decay * tree_distance)`.
++  The reference clone is treated as one level above the mutation-tree root for
++  this prior. `CactriOmega` has no tree and rejects this option.
++
++## Posterior interpretation
++
++Hypercluster labels are not identifiable across draws. Hypercluster-level trace
++summaries are aligned to the current partition by maximum cell overlap before
++averaging. Cell clone co-clustering is label-invariant and is computed directly
++from retained cell clone assignments.
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/MIGRATION.md /mnt/data/Cactri-v0.4.0/MIGRATION.md
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/MIGRATION.md	2026-07-31 18:44:41.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/MIGRATION.md	2026-08-01 07:33:22.022274293 +0000
+@@ -175,3 +175,56 @@
+ comparison. To bound the cost of global proposals, add
+ `max_restricted_cells` to `SplitMergeConfig`; omitting it retains the original
+ proposal.
++
++
++## Migrating from 0.2.2 to 0.4.0
++
++Version 0.4.0 is based directly on 0.2.2. Mixtures are opt-in, so existing
++constructors and fits retain the exact v0.2.2 model and seeded transition.
++
++Enable the extension with:
++
++```python
++from cactri import CloneMixtureConfig
++
++model = CactriTree(
++    n_levels=3,
++    clone_mixture=CloneMixtureConfig(enabled=True),
++)
++```
++
++The old `hypercluster_to_clone_` vector is now the dominant-clone vector. The
++new sampled cell-level clone labels are returned by
++`current_cell_clone_assignment()` and stored in `cell_clone_assignments_`.
++
++New canonical state attributes:
++
++```python
++model.dominant_clones_
++model.hypercluster_clone_proportions_
++model.cell_clone_assignments_
++model.admixture_mass_
++model.residual_clone_proportions_
++model.mixture_active_
++```
++
++For coherent mixture posterior summaries, use:
++
++```python
++tracking = TrackingConfig.posterior(mixture_diagnostics=True)
++model.fit(1_000, tracking=tracking)
++```
++
++`split_merge` remains available in legacy mode. It is intentionally unavailable
++with clone mixtures because the retained v0.2 collapsed target assumes one clone
++label per hypercluster.
++
++Trusted v0.1/v0.2 checkpoints migrate automatically to exact pure rows. v0.3.x
++checkpoints are rejected because that experimental line is not an ancestor of
++0.4.0.
++
++## From the discontinued 0.3.x branch
++
++There is no direct checkpoint migration. Recreate the model from source data or
++export the required arrays under 0.3.x and initialize a new 0.4.0 model. The
++blocked and hybrid partition kernels are not carried forward.
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/README.md /mnt/data/Cactri-v0.4.0/README.md
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/README.md	2026-07-31 18:50:12.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/README.md	2026-08-01 07:32:33.030272685 +0000
+@@ -3,15 +3,19 @@
+ Cactri is a research package for joint BCR hypercluster inference and clonal
+ mutation-genotype inference from single-cell sequence and read-count data.
+ 
+-The package is organized around an abstract shared model:
++The public models are:
+ 
+-- `CactriTree`: mutation origins on a fixed full binary tree, with an optional
+-  learned distance-aware error model for a supplied mutation tree.
++- `CactriTree`: mutation origins on a fixed full binary tree, optionally using
++  a probabilistic supplied mutation-tree estimate and a learned edge-error rate.
+ - `CactriOmega`: independent clone-by-mutation genotypes, optionally centered
+-  on a supplied genotype matrix through a learned relaxation rate.
++  on a supplied Omega matrix through a learned relaxation rate.
+ - `BCRInitializer`: standalone BCR-only CRP/Dirichlet initialization and
+   multi-chain consensus fitting.
+ 
++Version 0.4.0 adds an opt-in dominant-clone sparse-admixture model. One BCR
++hypercluster may contain cells from several mutation clones without creating a
++second BCR component.
++
+ ## Installation
+ 
+ ```bash
+@@ -24,185 +28,188 @@
+ pip install ".[numba]"
+ ```
+ 
+-## Basic use
++## Public imports
+ 
+ ```python
+ from cactri import (
+     BCRInitializer,
++    Cactri,
++    CactriOmega,
+     CactriTree,
++    CloneMixtureConfig,
+     SplitMergeConfig,
+     TrackingConfig,
+ )
++```
+ 
+-initializer = BCRInitializer(random_state=1)
+-initializer.consensus_fit(
+-    bcr_sequences,
+-    n_chains=4,
+-    n_iter=500,
++## Dominant-clone sparse admixture
++
++The extension is opt-in. Existing scripts retain the exact v0.2.2
++one-clone-per-hypercluster transition when `clone_mixture` is omitted.
++
++```python
++from cactri import CactriTree, CloneMixtureConfig, TrackingConfig
++
++mixture = CloneMixtureConfig(
++    enabled=True,
++    admixture_mass_prior=(1.0, 19.0),
++    residual_concentration=0.2,
++    residual_base="uniform",
++    allow_pure_hyperclusters=True,
++    mixture_presence_prior=(1.0, 9.0),
+ )
+ 
+ model = CactriTree(
+     n_levels=3,
+-    observed_edge_assignment=wes_edge_assignment,
++    observed_edge_probabilities=edge_posterior,
++    tree_prior="level_inverse",
++    learn_edge_error_rate=True,
++    clone_mixture=mixture,
+     random_state=2,
+ )
+ model.prefit(
+     bcr_sequences,
+     alt_counts,
+     total_counts,
+-    init=initializer.consensus_assignments_,
++    init="bcr_consensus",
+ )
+-result = model.fit(
++model.fit(
+     n_iter=1_000,
+-    assignment_sampler="split_merge",
+-    split_merge_config=SplitMergeConfig(
+-        local_sampler="approximate",
+-        proposals_per_sweep=2,
+-        cache_sufficient_statistics=True,
++    assignment_sampler="approximate",
++    tracking=TrackingConfig.posterior(
++        every=5,
++        mixture_diagnostics=True,
+     ),
+-    tracking=TrackingConfig.posterior(every=5),
+ )
+-
+-posterior = model.posterior_summary(burn_in=0.5)
+-cell_genotype_probability = posterior["cell_genotype_probabilities"]
+ ```
+ 
+-`prefit(init="bcr_consensus")` can run `BCRInitializer` internally. Explicit
+-cell-to-hypercluster vectors and the named modes `one_cluster`, `random`, and
+-`identical_sequences` are also supported.
++For cell `i`, `z_i` remains its BCR hypercluster and `y_i` is its cell-level
++mutation clone. Hypercluster `h` has clone proportions `pi_h`, shrunk toward one
++dominant clone. Pure hyperclusters use an exact one-hot row; impossible clone
++scores are represented as `-inf`, not by evaluating `log(0)`.
+ 
+-## Assignment samplers
+-
+-- `approximate` — vectorized approximate CRP sweep; default.
+-- `sequential` — cell-by-cell reassignment.
+-- `split_merge` — a configurable local sweep followed by collapsed,
+-  mutation-informed restricted-Gibbs split/merge proposals.
+-
+-The split/merge target integrates out BCR profiles and hypercluster-to-clone
+-labels. Mutation evidence therefore participates directly in proposals that can
+-split a BCR cluster into clone-homogeneous components.
+-
+-## Posterior summaries
+-
+-For posterior summaries, retain compatible traces:
++Canonical mixture state:
+ 
+ ```python
+-tracking = TrackingConfig.posterior(every=5)
+-model.fit(1_000, tracking=tracking)
+-summary = model.posterior_summary(burn_in=0.5)
++model.dominant_clones_
++model.hypercluster_clone_proportions_
++model.cell_clone_assignments_
++model.admixture_mass_
++model.residual_clone_proportions_
++model.mixture_active_
+ ```
+ 
+-The cell-genotype summary is coherent: for every retained draw, cell clone
+-labels are combined with the genotype state from that same draw before averaging.
+-Hypercluster uncertainty is summarized with a label-invariant cell
+-co-assignment matrix. Version 0.2.1 also provides sampled partition medoids:
++`hypercluster_to_clone_` and `hypercluster_to_clone` remain compatibility aliases
++for `dominant_clones_`. `current_cell_clone_assignment()` returns the sampled
++cell-level labels when mixtures are enabled.
+ 
+-```python
+-summary = model.posterior_summary(
+-    burn_in=0.5,
+-    include_partition_medoids=True,
+-)
+-hypercluster_medoid = summary["hypercluster_partition_medoid"]["assignment"]
+-```
+-
+-Stage-1 current-state calculations remain available through:
++## Posterior summaries
+ 
+ ```python
+-model.current_state_cell_clone_probabilities()
+-model.current_state_cell_genotype_probabilities()
+-```
++summary = model.posterior_summary(burn_in=0.5)
+ 
++cell_clone_probability = summary["cell_clone_probabilities"]
++cell_genotype_probability = summary["cell_genotype_probabilities"]
++cell_clone_coclustering = summary["cell_clone_coassignment"]
++hypercluster_clone_proportions = summary["hypercluster_clone_proportions"]
++dominant_clone_probability = summary["dominant_clone_probabilities"]
++admixture_probability = summary["admixture_probabilities"]
++```
++
++Dedicated methods include:
++
++```python
++model.posterior_cell_clone_probabilities()
++model.posterior_cell_genotype_probabilities()
++model.posterior_cell_clone_coassignment()
++model.posterior_cell_coclustering_probabilities()
++model.posterior_hypercluster_clone_proportions()
++model.posterior_dominant_clone_probabilities()
++model.posterior_admixture_probabilities()
++model.posterior_effective_clone_counts()
++```
++
++The cell-genotype summary is coherent: every retained cell-clone draw is
++combined with the genotype state from the same iteration before averaging.
++Tracked hypercluster-level quantities are aligned to the current partition by
++maximum cell overlap before averaging, making summaries invariant to numeric
++hypercluster label permutations.
+ 
+-## Cached and adaptive split/merge proposals
++## Assignment samplers
+ 
+-Repeated global proposals reuse sufficient statistics by default. This is a
+-computational optimization and preserves the seeded random stream:
++- `approximate`: vectorized approximate CRP sweep; default.
++- `sequential`: cell-by-cell reassignment.
++- `split_merge`: retained v0.2 collapsed restricted-Gibbs transition.
++
++The mixture extension supports `approximate` and `sequential`. The v0.2
++split/merge target integrates one clone label per hypercluster and is therefore
++explicitly unavailable when `clone_mixture.enabled=True`.
++
++## CRP concentration
++
++Mixture-enabled models sample the CRP concentration by default with the
++Escobar-West auxiliary update and `Gamma(1,1)` shape-rate prior. Legacy mode
++leaves `alpha` fixed by default, preserving v0.2.2 behavior.
+ 
+ ```python
+-config = SplitMergeConfig(
+-    proposals_per_sweep=4,
+-    cache_sufficient_statistics=True,
++model = CactriTree(
++    n_levels=3,
++    clone_mixture=mixture,
++    alpha_prior=(1.0, 1.0),
++    sample_alpha=True,
+ )
+ ```
+ 
+-Adaptive split-versus-merge scheduling is opt-in. The state-dependent anchor
+-selection probability is included in the Metropolis-Hastings correction:
++## Tree-aware residual admixture
++
++`CactriTree` optionally weights non-dominant clones by tree distance:
+ 
+ ```python
+-config = SplitMergeConfig(
+-    anchor_strategy="adaptive",
+-    initial_split_probability=0.5,
+-    adaptation_interval=25,
+-    adaptation_step=0.25,
+-    adapt_until=1_000,
++CloneMixtureConfig(
++    enabled=True,
++    residual_base="tree_distance",
++    tree_distance_decay=1.0,
+ )
+ ```
+ 
+-For formal posterior sampling, set `adapt_until` to end adaptation during
+-warm-up and keep the proposal fixed afterward.
++The default remains `uniform`, matching the existing simulation mechanism.
++`CactriOmega` rejects `tree_distance` because it has no clone tree.
+ 
+ ## Checkpoint and resume
+ 
+ ```python
+-model.fit(500, tracking=TrackingConfig.posterior(every=5))
+-model.save_checkpoint("tree_chain.cactri.gz")
+-
+-resumed = CactriTree.load_checkpoint(
+-    "tree_chain.cactri.gz",
+-    accelerator="numba",  # optional backend switch
+-)
+-resumed.fit(500, tracking=TrackingConfig.posterior(every=5))
++model.save_checkpoint("chain.cactri.gz")
++resumed = CactriTree.load_checkpoint("chain.cactri.gz", accelerator="numba")
+ ```
+ 
+-The exact RNG, adaptive-scheduler, diagnostics, and tracking cadence are
+-preserved. Checkpoints use pickle internally and must only be loaded from a
+-trusted source.
++Trusted v0.1.x and v0.2.x checkpoints migrate to an exact pure-mixture state:
++old hypercluster clone labels become dominant clones, clone proportions become
++one-hot, and cell clone labels are inherited from their hyperclusters. The RNG
++state and continuation remain exact.
+ 
+-## Observation defaults
++The v0.3.x experimental sampler branch was discontinued after simulation
++benchmarking and its checkpoints are intentionally rejected by the v0.4
++lineage with a clear error. Checkpoints use pickle internally and must only be
++loaded from trusted sources.
+ 
+-Version 0.2.x standardizes the absent-genotype observation prior to
+-`p_unobs ~ Beta(1, 999)`. Pass `p_unobs_beta_prior=(1, 99)` to reproduce the
+-Stage-1 default.
++## NumPy/Numba identity
+ 
+-## NumPy/Numba identity policy
++Cactri owns all random-number generation. Accelerator kernels receive
++pre-generated random values and maintain no hidden RNG state. Exact seeded
++NumPy/Numba identity is tested for Tree and Omega mixture chains, posterior
++tracking, and checkpoint continuation.
+ 
+-Cactri owns all random-number generation. The same pre-generated uniforms are
+-passed to NumPy and Numba kernels. Exact seeded chain identity is tested for both
+-models, including split/merge sampling. Numba kernels do not maintain hidden
+-random state.
++## Release lineage
+ 
+-## Versioning
++```text
++0.2.2 ───────────────► 0.4.0
++   \
++    └──► 0.3.0 ─► 0.3.1  [experimental, discontinued]
++```
+ 
+-Cactri uses semantic versioning. Release source trees and wheels are immutable.
+-Model or transition-kernel changes are introduced in a new minor version and
+-recorded in `CHANGELOG.md` and `MIGRATION.md`.
++Version 0.4.0 is based directly on 0.2.2. The 0.3.x artifacts remain available
++only for reproducibility.
+ 
+ ## License
+ 
+ GNU General Public License v3.0 only.
+-
+-## Probabilistic mutation-tree initialization
+-
+-A mutation-tree initializer can provide a full mutation-by-edge posterior rather
+-than a hard edge call:
+-
+-```python
+-from cactri import CactriTree, SplitMergeConfig
+-
+-model = CactriTree(
+-    n_levels=3,
+-    observed_edge_probabilities=edge_posterior,
+-    tree_prior="level_inverse",
+-    learn_edge_error_rate=True,
+-)
+-model.prefit(sequences, alt_counts, total_counts, init=bcr_assignments)
+-model.fit(
+-    1000,
+-    assignment_sampler="split_merge",
+-    split_merge_config=SplitMergeConfig(max_restricted_cells=500),
+-)
+-```
+-
+-The learned reliability parameter mixes the supplied posterior with an
+-inverse-distance-smoothed version. All random values are generated by the
+-model's NumPy generator and passed to the selected accelerator backend.
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/RELEASE_NOTES_0.4.0.md /mnt/data/Cactri-v0.4.0/RELEASE_NOTES_0.4.0.md
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/RELEASE_NOTES_0.4.0.md	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/RELEASE_NOTES_0.4.0.md	2026-08-01 07:32:33.030272685 +0000
+@@ -0,0 +1,41 @@
++# Cactri 0.4.0 release notes
++
++Cactri 0.4.0 branches directly from 0.2.2. The 0.3.x hybrid partition-sampler
++experiment is discontinued and is not part of this release.
++
++## Added
++
++- Opt-in `CloneMixtureConfig` shared by `CactriTree` and `CactriOmega`.
++- Cell-level mutation-clone labels within BCR hyperclusters.
++- Dominant-clone prior with sparse Beta-Dirichlet residual admixture.
++- Optional exact pure-hypercluster spike with sampled global admixture rate.
++- Uniform and optional tree-distance residual clone bases.
++- Exact conditional cell-clone sampling and mixture-marginalized hypercluster
++  assignment scores.
++- Cell-level mutation-count aggregation for Tree/Omega genotype and observation
++  updates.
++- CRP concentration sampling for mixture-enabled models.
++- Selectable mixture tracking and posterior summaries, including cell clone
++  co-clustering probabilities.
++- Trusted v0.1/v0.2 checkpoint migration to exact pure-mixture state.
++
++## Compatibility
++
++- Mixtures are disabled by default.
++- Disabled mode is bit-for-bit identical to v0.2.2 for approximate and
++  split/merge chains in characterization tests.
++- `hypercluster_to_clone_` remains an alias for the dominant clone vector.
++- `assignment_sampler="split_merge"` is retained for legacy mode and rejected
++  when clone mixtures are enabled because its v0.2 target assumes one clone per
++  hypercluster.
++- v0.3.x checkpoints are intentionally rejected with a lineage-specific error.
++
++## Validation
++
++- 59 package tests pass.
++- Exact NumPy/Numba seeded identity passes for Tree and Omega mixture chains.
++- Interrupted/checkpoint-resumed mixture chains exactly match uninterrupted
++  chains.
++- Actual v0.2.2 checkpoints continue exactly under v0.4.0.
++- A real v0.3.1 checkpoint is decoded and rejected with the documented error.
++- Exact-zero pure states remain finite and normalized.
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/VERSIONING.md /mnt/data/Cactri-v0.4.0/VERSIONING.md
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/VERSIONING.md	2026-07-31 18:53:44.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/VERSIONING.md	2026-08-01 07:33:22.138274297 +0000
+@@ -1,25 +1,31 @@
+ # Versioning and release policy
+ 
+-Cactri follows semantic versioning.
++Cactri follows semantic versioning and immutable release artifacts.
+ 
+-- **Patch release (`0.2.x`)**: bug fixes, documentation, and optimizations that
+-  do not intentionally change the target statistical model.
+-- **Minor release (`0.x.0`)**: new samplers, changed defaults, or additive model
+-  capabilities. Migration notes and characterization tests are required.
+-- **Major release (`x.0.0`)**: removal of deprecated public APIs or incompatible
+-  result-schema changes.
+-
+-A release is immutable after publication. Development for the next release is
+-performed in a copied source tree, and every release must include:
+-
+-1. a changelog entry;
+-2. migration notes for changed defaults or semantics;
+-3. unit and backend-identity tests;
+-4. a clean-install wheel smoke test;
+-5. a machine-readable validation report.
+-
+-## 0.2.2
+-
+-Backward-compatible support for probabilistic supplied tree estimates and
+-bounded split/merge proposals. Existing defaults and point-estimate behavior are
+-unchanged.
++## Lineage
++
++```text
++0.2.2 ───────────────► 0.4.0
++   \
++    └──► 0.3.0 ─► 0.3.1  [experimental, discontinued]
++```
++
++The 0.3 branch tested mutation-informed partition proposals. Simulation
++benchmarking found no improvement and zero accepted split-off moves across the
++main diagnostic. Future work therefore returned to 0.2.2 and changed the
++within-hypercluster clone model instead.
++
++## Release classes
++
++- Patch: bug fixes and computational changes that preserve the statistical
++  model.
++- Minor: additive models, new samplers, or changed opt-in semantics.
++- Major: removal of deprecated APIs or incompatible result schemas.
++
++Every release includes a changelog, migration guide, backend-identity tests,
++clean-install wheel test, validation report, source archive, and wheel.
++
++## 0.4.0
++
++Opt-in cell-level clone mixtures within BCR hyperclusters. Legacy behavior is
++unchanged by default. v0.3 checkpoints are not part of this lineage.
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/pyproject.toml /mnt/data/Cactri-v0.4.0/pyproject.toml
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/pyproject.toml	2026-07-31 18:41:26.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/pyproject.toml	2026-08-01 07:31:13.242270065 +0000
+@@ -4,7 +4,7 @@
+ 
+ [project]
+ name = "Cactri"
+-version = "0.2.2"
++version = "0.4.0"
+ description = "Joint BCR clustering and clonal genotype inference"
+ readme = "README.md"
+ requires-python = ">=3.10"
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/src/cactri/__init__.py /mnt/data/Cactri-v0.4.0/src/cactri/__init__.py
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/src/cactri/__init__.py	2026-07-31 18:41:26.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/src/cactri/__init__.py	2026-08-01 07:19:01.262246033 +0000
+@@ -2,7 +2,7 @@
+ 
+ from .base import Cactri
+ from .bcr_initializer import BCRInitializer
+-from .config import SplitMergeConfig, TrackingConfig
++from .config import CloneMixtureConfig, SplitMergeConfig, TrackingConfig
+ from .omega import CactriOmega
+ from .tree import CactriTree
+ 
+@@ -12,7 +12,8 @@
+     "CactriOmega",
+     "BCRInitializer",
+     "TrackingConfig",
++    "CloneMixtureConfig",
+     "SplitMergeConfig",
+ ]
+ 
+-__version__ = "0.2.2"
++__version__ = "0.4.0"
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/src/cactri/base.py /mnt/data/Cactri-v0.4.0/src/cactri/base.py
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/src/cactri/base.py	2026-07-31 18:42:16.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/src/cactri/base.py	2026-08-01 07:30:50.442269316 +0000
+@@ -12,7 +12,7 @@
+ import numpy as np
+ 
+ from ._numba_accelerator import Accelerator, Backend
+-from .config import SplitMergeConfig, TrackingConfig
++from .config import CloneMixtureConfig, SplitMergeConfig, TrackingConfig
+ from .state import StateView
+ from .utils.assignments import InitSpec, initialize_assignments, reindex_assignments
+ from .utils.posterior import (
+@@ -31,7 +31,7 @@
+ AssignmentSampler = Literal["approximate", "sequential", "split_merge"]
+ AssignmentLikelihood = Literal["joint", "bcr"]
+ NewClusterLikelihood = Literal["auxiliary", "prior_predictive"]
+-_CHECKPOINT_PACKAGE_VERSION = "0.2.2"
++_CHECKPOINT_PACKAGE_VERSION = "0.4.0"
+ 
+ 
+ @dataclass(slots=True)
+@@ -63,12 +63,15 @@
+         *,
+         n_clones: int,
+         alpha: float = 1.0,
++        alpha_prior: tuple[float, float] = (1.0, 1.0),
++        sample_alpha: bool | None = None,
+         dirichlet_prior: float | np.ndarray = 0.5,
+         p_obs_beta_prior: tuple[float, float] | np.ndarray = (50.0, 50.0),
+         p_unobs_beta_prior: tuple[float, float] = (1.0, 999.0),
+         p_obs_init: float | np.ndarray | None = None,
+         p_unobs_init: float | None = None,
+         clone_prior: np.ndarray | None = None,
++        clone_mixture: CloneMixtureConfig | None = None,
+         assignment_likelihood: AssignmentLikelihood = "joint",
+         new_cluster_likelihood: NewClusterLikelihood = "auxiliary",
+         accelerator: Backend = "auto",
+@@ -80,6 +83,8 @@
+             raise ValueError("n_clones must be at least 1.")
+         if alpha <= 0:
+             raise ValueError("alpha must be positive.")
++        if len(alpha_prior) != 2 or min(alpha_prior) <= 0:
++            raise ValueError("alpha_prior must contain positive shape and rate values.")
+         if assignment_likelihood not in {"joint", "bcr"}:
+             raise ValueError("assignment_likelihood must be 'joint' or 'bcr'.")
+         if new_cluster_likelihood not in {"auxiliary", "prior_predictive"}:
+@@ -92,6 +97,7 @@
+         self.n_clones = int(n_clones)
+         self.alpha = float(alpha)
+         self.alpha_ = float(alpha)
++        self.alpha_prior = tuple(float(x) for x in alpha_prior)
+         self.dirichlet_prior = dirichlet_prior
+         self.p_obs_beta_prior = np.asarray(p_obs_beta_prior, dtype=float)
+         self.p_unobs_beta_prior = tuple(float(x) for x in p_unobs_beta_prior)
+@@ -113,6 +119,10 @@
+                 raise ValueError("clone_prior must be a nonnegative vector of length n_clones.")
+             self.clone_prior = prior / prior.sum()
+         self.log_clone_prior = np.log(np.clip(self.clone_prior, self.eps, 1.0))
++        self.clone_mixture = clone_mixture or CloneMixtureConfig()
++        self.sample_alpha = (
++            self.clone_mixture.enabled if sample_alpha is None else bool(sample_alpha)
++        )
+ 
+         self.sequences_: np.ndarray | None = None
+         self.seqs_: np.ndarray | None = None  # legacy alias
+@@ -121,6 +131,12 @@
+         self.assignments_: np.ndarray | None = None
+         self.bcr_profiles_: np.ndarray | None = None
+         self.hypercluster_to_clone_: np.ndarray | None = None
++        self.cell_clone_assignments_: np.ndarray | None = None
++        self.hypercluster_clone_proportions_: np.ndarray | None = None
++        self.admixture_mass_: np.ndarray | None = None
++        self.residual_clone_proportions_: np.ndarray | None = None
++        self.mixture_active_: np.ndarray | None = None
++        self.mixture_presence_rate_: float | None = None
+         self.p_obs_by_mutation_: np.ndarray | None = None
+         self.p_unobs_: float | None = None
+         self._p_obs_beta_prior_matrix: np.ndarray | None = None
+@@ -141,6 +157,13 @@
+         self.cell_clone_assignment_trace_: list[np.ndarray] = []
+         self.genotype_state_trace_: list[np.ndarray] = []
+         self.p_obs_by_mutation_trace_: list[np.ndarray] = []
++        self.dominant_clone_trace_: list[np.ndarray] = []
++        self.hypercluster_clone_proportions_trace_: list[np.ndarray] = []
++        self.admixture_mass_trace_: list[np.ndarray] = []
++        self.mixture_active_trace_: list[np.ndarray] = []
++        self.effective_clone_count_trace_: list[np.ndarray] = []
++        self.admixture_entropy_trace_: list[np.ndarray] = []
++        self.dominant_fraction_trace_: list[np.ndarray] = []
+ 
+         self.split_merge_attempts_: int = 0
+         self.split_merge_accepts_: int = 0
+@@ -209,15 +232,24 @@
+ 
+         self.assignments_ = z
+         self.bcr_profiles_ = self._sample_bcr_profiles(z)
+-        self.hypercluster_to_clone_ = self.rng.choice(
+-            self.n_clones,
+-            size=self.n_hyperclusters,
+-            replace=True,
+-            p=self.clone_prior,
+-        ).astype(np.int64)
+-        self.p_obs_by_mutation_ = self._initialize_p_obs()
+-        self.p_unobs_ = self._initialize_p_unobs()
+-        self._initialize_genotype_state()
++        if not self.clone_mixture.enabled:
++            # Preserve the exact v0.2.2 random-number order when mixtures are off.
++            self.hypercluster_to_clone_ = self.rng.choice(
++                self.n_clones,
++                size=self.n_hyperclusters,
++                replace=True,
++                p=self.clone_prior,
++            ).astype(np.int64)
++            self.p_obs_by_mutation_ = self._initialize_p_obs()
++            self.p_unobs_ = self._initialize_p_unobs()
++            self._initialize_genotype_state()
++            self._sync_disabled_clone_mixture_state()
++        else:
++            self._validate_clone_mixture_support()
++            self.p_obs_by_mutation_ = self._initialize_p_obs()
++            self.p_unobs_ = self._initialize_p_unobs()
++            self._initialize_genotype_state()
++            self._initialize_clone_mixture_state()
+         self._clear_traces()
+         return self
+ 
+@@ -229,6 +261,8 @@
+         update_assignments: bool = True,
+         update_bcr_profiles: bool = True,
+         update_hypercluster_clones: bool = True,
++        update_cell_clones: bool | None = None,
++        update_clone_mixtures: bool | None = None,
+         update_genotypes: bool = True,
+         update_observation_probabilities: bool = True,
+         tracking: TrackingConfig | None = None,
+@@ -242,22 +276,48 @@
+         if assignment_sampler not in {"approximate", "sequential", "split_merge"}:
+             raise ValueError("unknown assignment_sampler.")
+         tracking = tracking or TrackingConfig()
++        update_cell_clones = (
++            update_hypercluster_clones if update_cell_clones is None else bool(update_cell_clones)
++        )
++        update_clone_mixtures = (
++            update_hypercluster_clones
++            if update_clone_mixtures is None
++            else bool(update_clone_mixtures)
++        )
+ 
+         for iteration in range(n_iter):
+-            if update_hypercluster_clones:
+-                self.hypercluster_to_clone_ = self._sample_hypercluster_clone_assignments()
+-            if update_bcr_profiles:
+-                self.bcr_profiles_ = self._sample_bcr_profiles(self.assignments_)
+-            if update_assignments:
+-                self.assignment_sweep(
+-                    assignment_sampler,
+-                    split_merge_config=split_merge_config,
+-                )
++            if self.clone_mixture.enabled:
++                # Partially collapsed Gibbs order: z, B, y, mixture, G, theta.
++                if update_assignments:
++                    self.assignment_sweep(
++                        assignment_sampler,
++                        split_merge_config=split_merge_config,
++                    )
++                if update_bcr_profiles and not update_assignments:
++                    self.bcr_profiles_ = self._sample_bcr_profiles(self.assignments_)
++                if update_cell_clones:
++                    self._sample_cell_clone_assignments()
++                if update_clone_mixtures:
++                    self._sample_clone_mixture_state()
++            else:
++                # Exact v0.2.2 transition order and random-number stream.
++                if update_hypercluster_clones:
++                    self.hypercluster_to_clone_ = self._sample_hypercluster_clone_assignments()
++                if update_bcr_profiles:
++                    self.bcr_profiles_ = self._sample_bcr_profiles(self.assignments_)
++                if update_assignments:
++                    self.assignment_sweep(
++                        assignment_sampler,
++                        split_merge_config=split_merge_config,
++                    )
++                self._sync_disabled_clone_mixture_state()
+             if update_genotypes:
+                 self._sample_genotype_state()
+                 self._update_genotype_prior_parameters()
+             if update_observation_probabilities:
+                 self._resample_observation_probabilities()
++            if self.sample_alpha:
++                self._resample_alpha()
+             self._iterations_completed_ += 1
+             if self._iterations_completed_ % tracking.every == 0:
+                 self._append_tracking(tracking)
+@@ -277,6 +337,11 @@
+         *,
+         split_merge_config: SplitMergeConfig | None = None,
+     ) -> None:
++        if self.clone_mixture.enabled and sampler == "split_merge":
++            raise ValueError(
++                "assignment_sampler='split_merge' is not defined for clone mixtures; "
++                "use 'approximate' or 'sequential'."
++            )
+         if sampler == "approximate":
+             self.approximate_assignment_sweep()
+         elif sampler == "sequential":
+@@ -353,8 +418,17 @@
+             compact = np.searchsorted(unique, z_tmp[new_mask])
+             new_h_to_clone[compact] = aux_clones[new_mask]
+         self.assignments_ = z_new
+-        self.hypercluster_to_clone_ = new_h_to_clone
++        if self.clone_mixture.enabled:
++            self._resize_clone_mixture_state(
++                z_old,
++                z_new,
++                dominant_hint=new_h_to_clone,
++            )
++        else:
++            self.hypercluster_to_clone_ = new_h_to_clone
+         self.bcr_profiles_ = self._sample_bcr_profiles(z_new)
++        if self.clone_mixture.enabled:
++            self._enforce_pure_clone_assignments()
+ 
+     def sequential_assignment_sweep(self) -> None:
+         """Cell-by-cell Gibbs-style reassignment using current profile parameters."""
+@@ -376,6 +450,8 @@
+                 active_old = [h for h in range(len(old_profiles)) if h != current]
+                 self.bcr_profiles_ = old_profiles[active_old]
+                 self.hypercluster_to_clone_ = old_clones[active_old]
++                if self.clone_mixture.enabled:
++                    self._subset_clone_mixture_rows(active_old)
+             else:
+                 z_without = old_z.copy()
+                 z_without[cell] = -1
+@@ -387,7 +463,10 @@
+             scores = np.log(np.clip(counts, self.eps, None)) + bcr_scores
+             if self.assignment_likelihood == "joint":
+                 clone_scores = self._cell_clone_mut_loglikelihood()[cell]
+-                scores += clone_scores[self.hypercluster_to_clone_]
++                if self.clone_mixture.enabled:
++                    scores += self._mixture_log_marginal_for_cell(clone_scores)
++                else:
++                    scores += clone_scores[self.hypercluster_to_clone_]
+             new_bcr = float(self._bcr_prior_predictive_loglikelihood(self.sequences_[cell : cell + 1])[0])
+             if self.assignment_likelihood == "joint":
+                 new_mut = float(
+@@ -401,16 +480,22 @@
+             choice = int(self._sample_rows(all_scores[None, :])[0])
+             if choice == n_h:
+                 self.assignments_[cell] = n_h
++                new_dominant = int(self.rng.choice(self.n_clones, p=self.clone_prior))
+                 self.hypercluster_to_clone_ = np.append(
+-                    self.hypercluster_to_clone_,
+-                    self.rng.choice(self.n_clones, p=self.clone_prior),
++                    self.hypercluster_to_clone_, new_dominant
+                 ).astype(np.int64)
++                if self.clone_mixture.enabled:
++                    self._append_clone_mixture_cluster(new_dominant)
+                 new_profile = self._sample_bcr_profiles(np.array([0], dtype=np.int64), sequences=self.sequences_[cell : cell + 1])
+                 self.bcr_profiles_ = np.concatenate([self.bcr_profiles_, new_profile], axis=0)
+             else:
+                 self.assignments_[cell] = choice
+         self.assignments_ = reindex_assignments(self.assignments_)
+         self.bcr_profiles_ = self._sample_bcr_profiles(self.assignments_)
++        if not self.clone_mixture.enabled:
++            self._sync_disabled_clone_mixture_state()
++        else:
++            self._enforce_pure_clone_assignments()
+ 
+     def split_merge_assignment_sweep(
+         self,
+@@ -1042,14 +1127,468 @@
+     # Shared likelihoods and updates
+     # ------------------------------------------------------------------
+ 
++    # ------------------------------------------------------------------
++    # Dominant-clone sparse-admixture model
++    # ------------------------------------------------------------------
++
++    @staticmethod
++    def _log_beta_function(a: float, b: float) -> float:
++        return float(math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b))
++
++    @staticmethod
++    def _safe_log_probabilities(probabilities: np.ndarray) -> np.ndarray:
++        probabilities = np.asarray(probabilities, dtype=float)
++        out = np.full(probabilities.shape, -np.inf, dtype=float)
++        positive = probabilities > 0.0
++        out[positive] = np.log(probabilities[positive])
++        return out
++
++    def _validate_clone_mixture_support(self) -> None:
++        if self.clone_mixture.residual_base == "tree_distance":
++            self._residual_base_weights(0)
++
++    def _tree_distance_residual_weights(self, dominant: int) -> np.ndarray:
++        raise ValueError(
++            "residual_base='tree_distance' is supported only by CactriTree."
++        )
++
++    def _residual_base_weights(self, dominant: int) -> np.ndarray:
++        if not 0 <= int(dominant) < self.n_clones:
++            raise ValueError("dominant clone is out of range.")
++        if self.n_clones == 1:
++            return np.zeros(1, dtype=float)
++        if self.clone_mixture.residual_base == "tree_distance":
++            weights = np.asarray(
++                self._tree_distance_residual_weights(int(dominant)), dtype=float
++            )
++        else:
++            weights = np.ones(self.n_clones, dtype=float)
++            weights[int(dominant)] = 0.0
++        weights = np.where(np.arange(self.n_clones) == int(dominant), 0.0, weights)
++        if np.any(weights < 0) or weights.sum() <= 0:
++            raise ValueError("residual clone base must have positive non-dominant mass.")
++        return weights / weights.sum()
++
++    def _sync_disabled_clone_mixture_state(self) -> None:
++        if self.assignments_ is None or self.hypercluster_to_clone_ is None:
++            return
++        dominant = np.asarray(self.hypercluster_to_clone_, dtype=np.int64)
++        self.cell_clone_assignments_ = dominant[self.assignments_].copy()
++        self.hypercluster_clone_proportions_ = np.eye(
++            self.n_clones, dtype=float
++        )[dominant]
++        self.admixture_mass_ = np.zeros(dominant.size, dtype=float)
++        self.residual_clone_proportions_ = np.zeros(
++            (dominant.size, self.n_clones), dtype=float
++        )
++        self.mixture_active_ = np.zeros(dominant.size, dtype=bool)
++        self.mixture_presence_rate_ = 0.0
++
++    def _initialize_clone_mixture_state(self) -> None:
++        self._validate_clone_mixture_support()
++        cell_clone_ll = self._cell_clone_mut_loglikelihood()
++        aggregate = np.zeros((self.n_hyperclusters, self.n_clones), dtype=float)
++        np.add.at(aggregate, self.assignments_, cell_clone_ll)
++        dominant = self._sample_rows(aggregate + self.log_clone_prior[None, :])
++        self.hypercluster_to_clone_ = dominant.astype(np.int64)
++        self.cell_clone_assignments_ = dominant[self.assignments_].astype(np.int64)
++        self.hypercluster_clone_proportions_ = np.eye(
++            self.n_clones, dtype=float
++        )[dominant]
++        self.admixture_mass_ = np.zeros(self.n_hyperclusters, dtype=float)
++        self.residual_clone_proportions_ = np.zeros(
++            (self.n_hyperclusters, self.n_clones), dtype=float
++        )
++        if self.clone_mixture.allow_pure_hyperclusters or self.n_clones == 1:
++            self.mixture_active_ = np.zeros(self.n_hyperclusters, dtype=bool)
++            a, b = self.clone_mixture.mixture_presence_prior
++            self.mixture_presence_rate_ = float(
++                np.clip(self.rng.beta(a, b), self.eps, 1.0 - self.eps)
++            )
++        else:
++            self.mixture_active_ = np.ones(self.n_hyperclusters, dtype=bool)
++            self.mixture_presence_rate_ = 1.0
++            self._sample_active_mixture_parameters(
++                self._clone_counts_by_hypercluster(), dominant
++            )
++
++    def _enforce_pure_clone_assignments(self) -> None:
++        """Keep exact-zero pure states internally valid after z transitions."""
++
++        for h in np.flatnonzero(~self.mixture_active_):
++            self.cell_clone_assignments_[self.assignments_ == h] = int(
++                self.dominant_clones_[h]
++            )
++
++    def _clone_counts_by_hypercluster(self) -> np.ndarray:
++        counts = np.zeros((self.n_hyperclusters, self.n_clones), dtype=np.int64)
++        np.add.at(counts, (self.assignments_, self.cell_clone_assignments_), 1)
++        return counts
++
++    def _collapsed_active_mixture_log_mass(
++        self, counts: np.ndarray, dominant: int
++    ) -> float:
++        counts = np.asarray(counts, dtype=np.int64)
++        n_dominant = int(counts[dominant])
++        n_residual = int(counts.sum() - n_dominant)
++        a, b = self.clone_mixture.admixture_mass_prior
++        score = self._log_beta_function(a + n_residual, b + n_dominant)
++        score -= self._log_beta_function(a, b)
++        if self.n_clones == 1:
++            return float(score)
++        weights = self._residual_base_weights(dominant)
++        mask = np.arange(self.n_clones) != dominant
++        alpha = self.clone_mixture.residual_concentration * weights[mask]
++        residual_counts = counts[mask].astype(float)
++        total_alpha = float(alpha.sum())
++        score += math.lgamma(total_alpha) - math.lgamma(
++            total_alpha + float(residual_counts.sum())
++        )
++        score += float(
++            np.sum(
++                [
++                    math.lgamma(float(x + n)) - math.lgamma(float(x))
++                    for x, n in zip(alpha, residual_counts, strict=True)
++                ]
++            )
++        )
++        return float(score)
++
++    def _sample_cell_clone_assignments(self) -> None:
++        scores = self._cell_clone_mut_loglikelihood()
++        scores = scores + self._safe_log_probabilities(
++            self.hypercluster_clone_proportions_[self.assignments_]
++        )
++        self.cell_clone_assignments_ = self._sample_rows(scores).astype(np.int64)
++
++    def _sample_clone_mixture_state(self) -> None:
++        counts = self._clone_counts_by_hypercluster()
++        n_h = self.n_hyperclusters
++        k = self.n_clones
++        scores = np.full((n_h, 2 * k), -np.inf, dtype=float)
++        rho = 1.0
++        if self.clone_mixture.allow_pure_hyperclusters and k > 1:
++            rho = float(np.clip(self.mixture_presence_rate_, self.eps, 1.0 - self.eps))
++        for h in range(n_h):
++            for dominant in range(k):
++                if k > 1:
++                    scores[h, dominant] = (
++                        math.log(rho)
++                        + self.log_clone_prior[dominant]
++                        + self._collapsed_active_mixture_log_mass(
++                            counts[h], dominant
++                        )
++                    )
++            if self.clone_mixture.allow_pure_hyperclusters or k == 1:
++                occupied = np.flatnonzero(counts[h] > 0)
++                if occupied.size == 1:
++                    dominant = int(occupied[0])
++                    pure_probability = 1.0 if k == 1 else 1.0 - rho
++                    scores[h, k + dominant] = (
++                        math.log(max(pure_probability, self.eps))
++                        + self.log_clone_prior[dominant]
++                    )
++        choice = self._sample_rows(scores)
++        active = choice < k
++        dominant = np.where(active, choice, choice - k).astype(np.int64)
++        self.hypercluster_to_clone_ = dominant
++        self.mixture_active_ = active.astype(bool)
++        if self.clone_mixture.allow_pure_hyperclusters and k > 1:
++            a, b = self.clone_mixture.mixture_presence_prior
++            self.mixture_presence_rate_ = float(
++                np.clip(
++                    self.rng.beta(a + int(active.sum()), b + int((~active).sum())),
++                    self.eps,
++                    1.0 - self.eps,
++                )
++            )
++        else:
++            self.mixture_presence_rate_ = 1.0 if k > 1 else 0.0
++        self._sample_active_mixture_parameters(counts, dominant)
++
++    def _sample_active_mixture_parameters(
++        self, counts: np.ndarray, dominant: np.ndarray
++    ) -> None:
++        proportions = np.zeros((self.n_hyperclusters, self.n_clones), dtype=float)
++        residual = np.zeros_like(proportions)
++        admixture = np.zeros(self.n_hyperclusters, dtype=float)
++        a, b = self.clone_mixture.admixture_mass_prior
++        for h in range(self.n_hyperclusters):
++            d = int(dominant[h])
++            if not bool(self.mixture_active_[h]) or self.n_clones == 1:
++                proportions[h, d] = 1.0
++                continue
++            n_dominant = int(counts[h, d])
++            n_residual = int(counts[h].sum() - n_dominant)
++            epsilon = float(
++                np.clip(
++                    self.rng.beta(a + n_residual, b + n_dominant),
++                    self.eps,
++                    1.0 - self.eps,
++                )
++            )
++            mask = np.arange(self.n_clones) != d
++            weights = self._residual_base_weights(d)[mask]
++            alpha = (
++                self.clone_mixture.residual_concentration * weights
++                + counts[h, mask]
++            )
++            draw = self.rng.gamma(shape=alpha, scale=1.0)
++            draw_sum = float(draw.sum())
++            if not np.isfinite(draw_sum) or draw_sum <= 0.0:
++                draw = weights.copy()
++            else:
++                draw = draw / draw_sum
++            residual[h, mask] = draw
++            admixture[h] = epsilon
++            proportions[h, d] = 1.0 - epsilon
++            proportions[h, mask] = epsilon * draw
++        self.admixture_mass_ = admixture
++        self.residual_clone_proportions_ = residual
++        self.hypercluster_clone_proportions_ = proportions
++
++    def _new_hypercluster_clone_prior(self) -> np.ndarray:
++        if self.n_clones == 1:
++            return np.ones(1, dtype=float)
++        a, b = self.clone_mixture.admixture_mass_prior
++        mean_admixture = float(a / (a + b))
++        if self.clone_mixture.allow_pure_hyperclusters:
++            rho = float(np.clip(self.mixture_presence_rate_, 0.0, 1.0))
++        else:
++            rho = 1.0
++        out = np.zeros(self.n_clones, dtype=float)
++        for dominant in range(self.n_clones):
++            base = float(self.clone_prior[dominant])
++            out[dominant] += base * (
++                (1.0 - rho) + rho * (1.0 - mean_admixture)
++            )
++            out += base * rho * mean_admixture * self._residual_base_weights(
++                dominant
++            )
++        return out / out.sum()
++
++    def _mixture_log_marginal_for_cell(self, cell_clone_scores: np.ndarray) -> np.ndarray:
++        out = np.empty(self.n_hyperclusters, dtype=float)
++        log_pi = self._safe_log_probabilities(
++            self.hypercluster_clone_proportions_
++        )
++        for h in range(self.n_hyperclusters):
++            out[h] = float(
++                self._logsumexp(
++                    (cell_clone_scores + log_pi[h])[None, :], axis=1
++                )[0]
++            )
++        return out
++
++    def _resize_clone_mixture_state(
++        self,
++        old_assignments: np.ndarray,
++        new_assignments: np.ndarray,
++        *,
++        dominant_hint: np.ndarray,
++    ) -> None:
++        old_dominant = self.hypercluster_to_clone_.copy()
++        old_proportions = self.hypercluster_clone_proportions_.copy()
++        old_admixture = self.admixture_mass_.copy()
++        old_residual = self.residual_clone_proportions_.copy()
++        old_active = self.mixture_active_.copy()
++        new_n_h = int(new_assignments.max()) + 1
++        contingency = np.zeros(
++            (new_n_h, int(old_assignments.max()) + 1), dtype=np.int64
++        )
++        np.add.at(contingency, (new_assignments, old_assignments), 1)
++        source = contingency.argmax(axis=1)
++        dominant = np.asarray(dominant_hint, dtype=np.int64).copy()
++        proportions = old_proportions[source].copy()
++        admixture = old_admixture[source].copy()
++        residual = old_residual[source].copy()
++        active = old_active[source].copy()
++        changed = dominant != old_dominant[source]
++        for h in np.flatnonzero(changed):
++            proportions[h] = 0.0
++            proportions[h, dominant[h]] = 1.0
++            residual[h] = 0.0
++            admixture[h] = 0.0
++            active[h] = False
++        self.hypercluster_to_clone_ = dominant
++        self.hypercluster_clone_proportions_ = proportions
++        self.admixture_mass_ = admixture
++        self.residual_clone_proportions_ = residual
++        self.mixture_active_ = active
++
++    def _subset_clone_mixture_rows(self, active_rows: list[int]) -> None:
++        rows = np.asarray(active_rows, dtype=np.int64)
++        self.hypercluster_clone_proportions_ = self.hypercluster_clone_proportions_[rows]
++        self.admixture_mass_ = self.admixture_mass_[rows]
++        self.residual_clone_proportions_ = self.residual_clone_proportions_[rows]
++        self.mixture_active_ = self.mixture_active_[rows]
++
++    def _append_clone_mixture_cluster(self, dominant: int) -> None:
++        row = np.zeros((1, self.n_clones), dtype=float)
++        row[0, int(dominant)] = 1.0
++        self.hypercluster_clone_proportions_ = np.concatenate(
++            [self.hypercluster_clone_proportions_, row], axis=0
++        )
++        self.admixture_mass_ = np.append(self.admixture_mass_, 0.0)
++        self.residual_clone_proportions_ = np.concatenate(
++            [
++                self.residual_clone_proportions_,
++                np.zeros((1, self.n_clones), dtype=float),
++            ],
++            axis=0,
++        )
++        self.mixture_active_ = np.append(self.mixture_active_, False)
++
++    def _clone_mixture_log_prior(self) -> float:
++        counts = self._clone_counts_by_hypercluster()
++        rho = float(np.clip(self.mixture_presence_rate_, self.eps, 1.0 - self.eps))
++        a, b = self.clone_mixture.admixture_mass_prior
++        total = 0.0
++        for h in range(self.n_hyperclusters):
++            d = int(self.dominant_clones_[h])
++            total += float(self.log_clone_prior[d])
++            if not bool(self.mixture_active_[h]):
++                if np.any(self.cell_clone_assignments_[self.assignments_ == h] != d):
++                    return -np.inf
++                if self.clone_mixture.allow_pure_hyperclusters:
++                    total += math.log1p(-rho)
++                continue
++            if self.clone_mixture.allow_pure_hyperclusters:
++                total += math.log(rho)
++            epsilon = float(self.admixture_mass_[h])
++            total += (a - 1.0) * math.log(epsilon)
++            total += (b - 1.0) * math.log1p(-epsilon)
++            total -= self._log_beta_function(a, b)
++            mask = np.arange(self.n_clones) != d
++            weights = self._residual_base_weights(d)[mask]
++            alpha = self.clone_mixture.residual_concentration * weights
++            q = self.residual_clone_proportions_[h, mask]
++            total += math.lgamma(float(alpha.sum()))
++            total -= sum(math.lgamma(float(x)) for x in alpha)
++            total += float(np.sum((alpha - 1.0) * np.log(q)))
++            log_pi = self._safe_log_probabilities(
++                self.hypercluster_clone_proportions_[h]
++            )
++            occupied = counts[h] > 0
++            total += float(np.sum(counts[h, occupied] * log_pi[occupied]))
++        return float(total)
++
++    def _clone_mixture_hyperprior_log_prior(self) -> float:
++        if not (
++            self.clone_mixture.enabled
++            and self.clone_mixture.allow_pure_hyperclusters
++            and self.n_clones > 1
++        ):
++            return 0.0
++        a, b = self.clone_mixture.mixture_presence_prior
++        rho = float(np.clip(self.mixture_presence_rate_, self.eps, 1.0 - self.eps))
++        return float(
++            (a - 1.0) * math.log(rho)
++            + (b - 1.0) * math.log1p(-rho)
++            - self._log_beta_function(a, b)
++        )
++
++    def current_effective_clone_counts(self) -> np.ndarray:
++        return 1.0 / np.sum(self.hypercluster_clone_proportions_ ** 2, axis=1)
++
++    def current_admixture_entropy(self) -> np.ndarray:
++        p = self.hypercluster_clone_proportions_
++        out = np.zeros(p.shape[0], dtype=float)
++        for h in range(p.shape[0]):
++            positive = p[h] > 0.0
++            out[h] = -float(np.sum(p[h, positive] * np.log(p[h, positive])))
++        return out
++
++    def current_dominant_fractions(self) -> np.ndarray:
++        return np.max(self.hypercluster_clone_proportions_, axis=1)
++
++    def _migrate_clone_mixture_state(self) -> None:
++        if not hasattr(self, "clone_mixture"):
++            self.clone_mixture = CloneMixtureConfig(enabled=False)
++        for name in (
++            "dominant_clone_trace_",
++            "hypercluster_clone_proportions_trace_",
++            "admixture_mass_trace_",
++            "mixture_active_trace_",
++            "effective_clone_count_trace_",
++            "admixture_entropy_trace_",
++            "dominant_fraction_trace_",
++        ):
++            if not hasattr(self, name):
++                setattr(self, name, [])
++        if not hasattr(self, "_iterations_completed_"):
++            self._iterations_completed_ = 0
++        if not hasattr(self, "alpha_prior"):
++            self.alpha_prior = (1.0, 1.0)
++        if not hasattr(self, "sample_alpha"):
++            self.sample_alpha = False
++        if getattr(self, "assignments_", None) is None:
++            return
++        if getattr(self, "hypercluster_to_clone_", None) is None:
++            return
++        required = (
++            "cell_clone_assignments_",
++            "hypercluster_clone_proportions_",
++            "admixture_mass_",
++            "residual_clone_proportions_",
++            "mixture_active_",
++            "mixture_presence_rate_",
++        )
++        if any(not hasattr(self, name) or getattr(self, name) is None for name in required):
++            # v0.1/v0.2 checkpoints become an exact pure-mixture state.
++            self.cell_clone_assignments_ = self.hypercluster_to_clone_[
++                self.assignments_
++            ].copy()
++            self.hypercluster_clone_proportions_ = np.eye(
++                self.n_clones, dtype=float
++            )[self.hypercluster_to_clone_]
++            self.admixture_mass_ = np.zeros(self.n_hyperclusters, dtype=float)
++            self.residual_clone_proportions_ = np.zeros(
++                (self.n_hyperclusters, self.n_clones), dtype=float
++            )
++            self.mixture_active_ = np.zeros(self.n_hyperclusters, dtype=bool)
++            self.mixture_presence_rate_ = 0.0
++
++    @property
++    def dominant_clones_(self) -> np.ndarray | None:
++        """Canonical dominant clone per hypercluster.
++
++        ``hypercluster_to_clone_`` remains the deprecated v0.2 compatibility
++        storage and always aliases this property.
++        """
++
++        return self.hypercluster_to_clone_
++
++    @dominant_clones_.setter
++    def dominant_clones_(self, value: np.ndarray | None) -> None:
++        self.hypercluster_to_clone_ = value
++
++    @property
++    def hypercluster_to_clone(self) -> np.ndarray | None:
++        """Deprecated alias for :attr:`dominant_clones_`."""
++
++        return self.dominant_clones_
++
++    @hypercluster_to_clone.setter
++    def hypercluster_to_clone(self, value: np.ndarray | None) -> None:
++        self.dominant_clones_ = value
++
+     def current_cell_clone_assignment(self) -> np.ndarray:
+         self._require_prefit()
++        if self.clone_mixture.enabled:
++            return self.cell_clone_assignments_
+         return self.hypercluster_to_clone_[self.assignments_]
+ 
+     def current_state_cell_clone_probabilities(self) -> np.ndarray:
+         """Return clone probabilities conditional on the current sampler state."""
+ 
+         self._require_prefit()
++        if self.clone_mixture.enabled:
++            scores = self._safe_log_probabilities(
++                self.hypercluster_clone_proportions_[self.assignments_]
++            ) + self._cell_clone_mut_loglikelihood()
++            normalizer = self._logsumexp(scores, axis=1)
++            return np.exp(scores - normalizer[:, None])
+         bcr = self._cell_hypercluster_bcr_loglikelihood()
+         mut = self._cell_hypercluster_mut_loglikelihood()
+         counts = np.bincount(self.assignments_, minlength=self.n_hyperclusters).astype(float)
+@@ -1134,6 +1673,164 @@
+             self.assignment_trace_, burn_in=burn_in, thin=thin
+         )
+ 
++    def posterior_cell_clone_coassignment(
++        self,
++        *,
++        burn_in: int | float = 0,
++        thin: int = 1,
++    ) -> np.ndarray:
++        """Return posterior probabilities that pairs of cells share a clone."""
++
++        if not self.cell_clone_assignment_trace_:
++            raise RuntimeError(
++                "cell-clone tracking is required for clone co-clustering summaries."
++            )
++        return coassignment_probabilities_from_trace(
++            self.cell_clone_assignment_trace_, burn_in=burn_in, thin=thin
++        )
++
++    def posterior_cell_coclustering_probabilities(
++        self,
++        *,
++        burn_in: int | float = 0,
++        thin: int = 1,
++    ) -> np.ndarray:
++        """Alias for :meth:`posterior_cell_clone_coassignment`."""
++
++        return self.posterior_cell_clone_coassignment(
++            burn_in=burn_in, thin=thin
++        )
++
++    @staticmethod
++    def _selected_trace_indices(
++        n_draws: int, burn_in: int | float, thin: int
++    ) -> np.ndarray:
++        if thin < 1:
++            raise ValueError("thin must be at least 1.")
++        if isinstance(burn_in, float):
++            if not 0.0 <= burn_in < 1.0:
++                raise ValueError("fractional burn_in must lie in [0,1).")
++            start = int(math.floor(n_draws * burn_in))
++        else:
++            start = int(burn_in)
++            if start < 0:
++                raise ValueError("burn_in must be nonnegative.")
++        indices = np.arange(start, n_draws, thin, dtype=np.int64)
++        if indices.size == 0:
++            raise ValueError("no posterior draws remain after burn-in and thinning.")
++        return indices
++
++    def _map_hypercluster_trace_to_current_partition(
++        self,
++        values_trace: list[np.ndarray],
++        *,
++        burn_in: int | float,
++        thin: int,
++    ) -> np.ndarray:
++        if not values_trace or len(values_trace) != len(self.assignment_trace_):
++            raise RuntimeError(
++                "matching assignment and hypercluster-mixture tracking are required."
++            )
++        indices = self._selected_trace_indices(
++            len(values_trace), burn_in, thin
++        )
++        current = np.asarray(self.assignments_, dtype=np.int64)
++        current_h = self.n_hyperclusters
++        mapped: list[np.ndarray] = []
++        for index in indices:
++            draw_z = np.asarray(self.assignment_trace_[int(index)], dtype=np.int64)
++            draw_values = np.asarray(values_trace[int(index)])
++            draw_h = int(draw_z.max()) + 1
++            contingency = np.zeros((current_h, draw_h), dtype=np.int64)
++            np.add.at(contingency, (current, draw_z), 1)
++            match = contingency.argmax(axis=1)
++            mapped.append(draw_values[match])
++        return np.asarray(mapped)
++
++    def posterior_hypercluster_clone_proportions(
++        self,
++        *,
++        burn_in: int | float = 0,
++        thin: int = 1,
++    ) -> np.ndarray:
++        """Return clone proportions for the current hyperclusters.
++
++        Tracked hyperclusters are matched to the current partition by maximum
++        cell overlap before averaging, making the result invariant to numeric
++        hypercluster-label permutations.
++        """
++
++        if self.hypercluster_clone_proportions_trace_:
++            mapped = self._map_hypercluster_trace_to_current_partition(
++                self.hypercluster_clone_proportions_trace_,
++                burn_in=burn_in,
++                thin=thin,
++            )
++            return np.mean(mapped, axis=0)
++        clone_probability = self.posterior_cell_clone_probabilities(
++            burn_in=burn_in, thin=thin
++        )
++        out = np.zeros((self.n_hyperclusters, self.n_clones), dtype=float)
++        for h in range(self.n_hyperclusters):
++            out[h] = clone_probability[self.assignments_ == h].mean(axis=0)
++        return out
++
++    def posterior_dominant_clone_probabilities(
++        self,
++        *,
++        burn_in: int | float = 0,
++        thin: int = 1,
++    ) -> np.ndarray:
++        """Return posterior dominant-clone probabilities for current hyperclusters."""
++
++        if self.dominant_clone_trace_:
++            mapped = self._map_hypercluster_trace_to_current_partition(
++                self.dominant_clone_trace_, burn_in=burn_in, thin=thin
++            ).astype(np.int64)
++            out = np.zeros((self.n_hyperclusters, self.n_clones), dtype=float)
++            for draw in mapped:
++                out[np.arange(self.n_hyperclusters), draw] += 1.0
++            return out / mapped.shape[0]
++        proportions = self.posterior_hypercluster_clone_proportions(
++            burn_in=burn_in, thin=thin
++        )
++        out = np.zeros_like(proportions)
++        out[np.arange(self.n_hyperclusters), proportions.argmax(axis=1)] = 1.0
++        return out
++
++    def posterior_admixture_probabilities(
++        self,
++        *,
++        burn_in: int | float = 0,
++        thin: int = 1,
++    ) -> np.ndarray:
++        """Return posterior probabilities that current hyperclusters are admixed."""
++
++        if self.mixture_active_trace_:
++            mapped = self._map_hypercluster_trace_to_current_partition(
++                self.mixture_active_trace_, burn_in=burn_in, thin=thin
++            )
++            return np.mean(mapped.astype(float), axis=0)
++        return self.mixture_active_.astype(float)
++
++    def posterior_effective_clone_counts(
++        self,
++        *,
++        burn_in: int | float = 0,
++        thin: int = 1,
++    ) -> np.ndarray:
++        """Return posterior effective clone count for each current hypercluster."""
++
++        if self.effective_clone_count_trace_:
++            mapped = self._map_hypercluster_trace_to_current_partition(
++                self.effective_clone_count_trace_, burn_in=burn_in, thin=thin
++            )
++            return np.mean(mapped, axis=0)
++        proportions = self.posterior_hypercluster_clone_proportions(
++            burn_in=burn_in, thin=thin
++        )
++        return 1.0 / np.sum(proportions**2, axis=1)
++
+     def posterior_hypercluster_partition_medoid(
+         self,
+         *,
+@@ -1215,7 +1912,27 @@
+             "hypercluster_coassignment": self.posterior_hypercluster_coassignment(
+                 burn_in=burn_in, thin=thin
+             ),
++            "cell_clone_coassignment": self.posterior_cell_clone_coassignment(
++                burn_in=burn_in, thin=thin
++            ),
+         }
++        if self.clone_mixture.enabled:
++            summary.update(
++                {
++                    "hypercluster_clone_proportions": self.posterior_hypercluster_clone_proportions(
++                        burn_in=burn_in, thin=thin
++                    ),
++                    "dominant_clone_probabilities": self.posterior_dominant_clone_probabilities(
++                        burn_in=burn_in, thin=thin
++                    ),
++                    "admixture_probabilities": self.posterior_admixture_probabilities(
++                        burn_in=burn_in, thin=thin
++                    ),
++                    "effective_clone_counts": self.posterior_effective_clone_counts(
++                        burn_in=burn_in, thin=thin
++                    ),
++                }
++            )
+         if include_partition_medoids:
+             summary["hypercluster_partition_medoid"] = (
+                 self.posterior_hypercluster_partition_medoid(
+@@ -1237,6 +1954,7 @@
+ 
+     def __setstate__(self, state: dict[str, Any]) -> None:
+         self.__dict__.update(state)
++        self._migrate_clone_mixture_state()
+         self.state_ = StateView(self)
+         self._split_merge_cache_ = None
+ 
+@@ -1296,6 +2014,13 @@
+             raise ValueError("not a Cactri checkpoint.")
+         if payload.get("format_version") != 1:
+             raise ValueError("unsupported Cactri checkpoint format version.")
++        package_version = str(payload.get("package_version", "0.1"))
++        if package_version.startswith("0.3"):
++            raise ValueError(
++                "Cactri 0.3.x checkpoints belong to the discontinued experimental "
++                "sampler branch and cannot be loaded by the 0.4 lineage. Resume or "
++                "export the state with Cactri 0.3.x instead."
++            )
+         model = payload.get("model")
+         if not isinstance(model, Cactri):
+             raise TypeError("checkpoint does not contain a Cactri model.")
+@@ -1312,6 +2037,7 @@
+         )
+         model.accelerator_name = model.accelerator.backend
+         model.deterministic = deterministic_value
++        model._migrate_clone_mixture_state()
+         model.state_ = StateView(model)
+         model._split_merge_cache_ = None
+         return model
+@@ -1319,7 +2045,14 @@
+     def log_likelihood_components(self) -> dict[str, float]:
+         rows = np.arange(self.n_cells)
+         bcr = float(self._cell_hypercluster_bcr_loglikelihood()[rows, self.assignments_].sum())
+-        mutation = float(self._cell_hypercluster_mut_loglikelihood()[rows, self.assignments_].sum())
++        if self.clone_mixture.enabled:
++            mutation = float(
++                self._cell_clone_mut_loglikelihood()[rows, self.cell_clone_assignments_].sum()
++            )
++        else:
++            mutation = float(
++                self._cell_hypercluster_mut_loglikelihood()[rows, self.assignments_].sum()
++            )
+         return {"bcr": bcr, "mutation": mutation, "total": bcr + mutation}
+ 
+     def log_likelihood(self) -> float:
+@@ -1333,7 +2066,9 @@
+         return float(out)
+ 
+     def clone_assignment_log_prior(self) -> float:
+-        return float(np.sum(self.log_clone_prior[self.hypercluster_to_clone_]))
++        if not self.clone_mixture.enabled:
++            return float(np.sum(self.log_clone_prior[self.hypercluster_to_clone_]))
++        return self._clone_mixture_log_prior()
+ 
+     def log_posterior(self) -> float:
+         return float(
+@@ -1341,6 +2076,8 @@
+             + self.crp_assignment_log_prior()
+             + self.clone_assignment_log_prior()
+             + self._genotype_log_prior()
++            + self._clone_mixture_hyperprior_log_prior()
++            + self._alpha_log_prior()
+             + self._extra_log_prior()
+         )
+ 
+@@ -1362,11 +2099,25 @@
+         return absent.sum(axis=1)[:, None] + (present - absent) @ genotype.T
+ 
+     def _cell_hypercluster_mut_loglikelihood(self) -> np.ndarray:
+-        return self._cell_clone_mut_loglikelihood()[:, self.hypercluster_to_clone_]
++        cell_clone = self._cell_clone_mut_loglikelihood()
++        if not self.clone_mixture.enabled:
++            return cell_clone[:, self.hypercluster_to_clone_]
++        out = np.empty((self.n_cells, self.n_hyperclusters), dtype=float)
++        log_pi = self._safe_log_probabilities(self.hypercluster_clone_proportions_)
++        for h in range(self.n_hyperclusters):
++            out[:, h] = self._logsumexp(cell_clone + log_pi[h][None, :], axis=1)
++        return out
+ 
+     def _new_hypercluster_mutation_loglikelihood(self) -> np.ndarray:
++        prior = (
++            self._new_hypercluster_clone_prior()
++            if self.clone_mixture.enabled
++            else self.clone_prior
++        )
+         return self._logsumexp(
+-            self._cell_clone_mut_loglikelihood() + self.log_clone_prior[None, :], axis=1
++            self._cell_clone_mut_loglikelihood()
++            + self._safe_log_probabilities(prior)[None, :],
++            axis=1,
+         )
+ 
+     def _sample_bcr_profiles(
+@@ -1446,6 +2197,29 @@
+             self.n_clones,
+         )
+ 
++    def _resample_alpha(self) -> None:
++        """Escobar-West auxiliary update for the CRP concentration."""
++
++        shape_prior, rate_prior = self.alpha_prior
++        eta = float(self.rng.beta(self.alpha_ + 1.0, self.n_cells))
++        rate = float(rate_prior - math.log(max(eta, self.eps)))
++        numerator = shape_prior + self.n_hyperclusters - 1.0
++        mixture_probability = numerator / (
++            self.n_cells * rate + numerator
++        )
++        shape = (
++            shape_prior + self.n_hyperclusters
++            if self.rng.random() < mixture_probability
++            else shape_prior + self.n_hyperclusters - 1.0
++        )
++        self.alpha_ = float(self.rng.gamma(shape=shape, scale=1.0 / rate))
++
++    def _alpha_log_prior(self) -> float:
++        if not self.sample_alpha:
++            return 0.0
++        shape, rate = self.alpha_prior
++        return float((shape - 1.0) * math.log(self.alpha_) - rate * self.alpha_)
++
+     def _resample_observation_probabilities(self) -> None:
+         genotype = self._genotype_matrix().astype(bool)
+         alt_by_clone, ref_by_clone = self._aggregate_mutation_counts_by_clone()
+@@ -1508,6 +2282,13 @@
+             "cell_clone_assignment_trace_",
+             "genotype_state_trace_",
+             "p_obs_by_mutation_trace_",
++            "dominant_clone_trace_",
++            "hypercluster_clone_proportions_trace_",
++            "admixture_mass_trace_",
++            "mixture_active_trace_",
++            "effective_clone_count_trace_",
++            "admixture_entropy_trace_",
++            "dominant_fraction_trace_",
+         ):
+             getattr(self, name).clear()
+         self.split_merge_attempts_ = 0
+@@ -1542,7 +2323,13 @@
+             self.clone_assignment_logprior_trace_.append(clone)
+             self.genotype_logprior_trace_.append(genotype)
+             self.log_posterior_trace_.append(
+-                components["total"] + crp + clone + genotype + self._extra_log_prior()
++                components["total"]
++                + crp
++                + clone
++                + genotype
++                + self._clone_mixture_hyperprior_log_prior()
++                + self._alpha_log_prior()
++                + self._extra_log_prior()
+             )
+         self.n_hyperclusters_trace_.append(self.n_hyperclusters)
+         self.alpha_trace_.append(self.alpha_)
+@@ -1556,6 +2343,24 @@
+             self.genotype_state_trace_.append(self._genotype_state_for_tracking().copy())
+         if config.observation_probabilities:
+             self.p_obs_by_mutation_trace_.append(self.p_obs_by_mutation_.copy())
++        if config.dominant_clones:
++            self.dominant_clone_trace_.append(self.dominant_clones_.copy())
++        if config.clone_proportions:
++            self.hypercluster_clone_proportions_trace_.append(
++                self.hypercluster_clone_proportions_.copy()
++            )
++        if config.admixture_mass:
++            self.admixture_mass_trace_.append(self.admixture_mass_.copy())
++        if config.mixture_active:
++            self.mixture_active_trace_.append(self.mixture_active_.copy())
++        if config.effective_clone_counts:
++            self.effective_clone_count_trace_.append(
++                self.current_effective_clone_counts().copy()
++            )
++        if config.admixture_entropy:
++            self.admixture_entropy_trace_.append(self.current_admixture_entropy().copy())
++        if config.dominant_fraction:
++            self.dominant_fraction_trace_.append(self.current_dominant_fractions().copy())
+         self._append_subclass_tracking(config)
+ 
+     def to_dict(self) -> dict[str, Any]:
+@@ -1565,6 +2370,13 @@
+             "assignments": self.assignments_.copy(),
+             "bcr_profiles": self.bcr_profiles_.copy(),
+             "hypercluster_to_clone": self.hypercluster_to_clone_.copy(),
++            "dominant_clones": self.dominant_clones_.copy(),
++            "hypercluster_clone_proportions": self.hypercluster_clone_proportions_.copy(),
++            "admixture_mass": self.admixture_mass_.copy(),
++            "residual_clone_proportions": self.residual_clone_proportions_.copy(),
++            "mixture_active": self.mixture_active_.copy(),
++            "mixture_presence_rate": float(self.mixture_presence_rate_),
++            "clone_mixture_config": self.clone_mixture,
+             "cell_clone_assignment": self.current_cell_clone_assignment().copy(),
+             "cell_clone_assignments": self.current_cell_clone_assignment().copy(),
+             "genotype_matrix": genotype,
+@@ -1572,6 +2384,8 @@
+             "p_obs_by_mutation": self.p_obs_by_mutation_.copy(),
+             "p_unobs": float(self.p_unobs_),
+             "alpha": float(self.alpha_),
++            "alpha_prior": self.alpha_prior,
++            "sample_alpha": self.sample_alpha,
+             "n_hyperclusters": self.n_hyperclusters,
+             "n_clones": self.n_clones,
+             "iterations_completed": self._iterations_completed_,
+@@ -1598,6 +2412,21 @@
+             ),
+             "genotype_state_trace": np.asarray(self.genotype_state_trace_),
+             "p_obs_by_mutation_trace": np.asarray(self.p_obs_by_mutation_trace_, dtype=float),
++            "dominant_clone_trace": np.asarray(self.dominant_clone_trace_, dtype=object),
++            "hypercluster_clone_proportions_trace": np.asarray(
++                self.hypercluster_clone_proportions_trace_, dtype=object
++            ),
++            "admixture_mass_trace": np.asarray(self.admixture_mass_trace_, dtype=object),
++            "mixture_active_trace": np.asarray(self.mixture_active_trace_, dtype=object),
++            "effective_clone_count_trace": np.asarray(
++                self.effective_clone_count_trace_, dtype=object
++            ),
++            "admixture_entropy_trace": np.asarray(
++                self.admixture_entropy_trace_, dtype=object
++            ),
++            "dominant_fraction_trace": np.asarray(
++                self.dominant_fraction_trace_, dtype=object
++            ),
+             "split_merge_diagnostics": self.split_merge_diagnostics(),
+             "current_state_cell_clone_probabilities": self.current_state_cell_clone_probabilities(),
+             "current_state_cell_genotype_probabilities": self.current_state_cell_genotype_probabilities(),
+@@ -1615,6 +2444,10 @@
+             out["posterior_hypercluster_coassignment"] = (
+                 self.posterior_hypercluster_coassignment()
+             )
++        if self.cell_clone_assignment_trace_:
++            out["posterior_cell_clone_coassignment"] = (
++                self.posterior_cell_clone_coassignment()
++            )
+         out.update(self._extra_to_dict())
+         return out
+ 
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/src/cactri/config.py /mnt/data/Cactri-v0.4.0/src/cactri/config.py
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/src/cactri/config.py	2026-07-31 18:42:00.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/src/cactri/config.py	2026-08-01 07:33:54.730275367 +0000
+@@ -4,15 +4,47 @@
+ from typing import Literal
+ 
+ 
++ResidualCloneBase = Literal["uniform", "tree_distance"]
++
++
++@dataclass(frozen=True, slots=True)
++class CloneMixtureConfig:
++    """Dominant-clone sparse-admixture model within each BCR hypercluster.
++
++    Mixtures are opt-in. When disabled, Cactri follows the exact v0.2.2
++    one-clone-per-hypercluster model. When enabled, each cell receives its own
++    latent mutation-clone label, shrunk toward one dominant clone per BCR
++    hypercluster.
++    """
++
++    enabled: bool = False
++    admixture_mass_prior: tuple[float, float] = (1.0, 19.0)
++    residual_concentration: float = 0.2
++    residual_base: ResidualCloneBase = "uniform"
++    tree_distance_decay: float = 1.0
++    allow_pure_hyperclusters: bool = True
++    mixture_presence_prior: tuple[float, float] = (1.0, 9.0)
++
++    def __post_init__(self) -> None:
++        if len(self.admixture_mass_prior) != 2 or min(self.admixture_mass_prior) <= 0:
++            raise ValueError("admixture_mass_prior must contain two positive values.")
++        if self.residual_concentration <= 0:
++            raise ValueError("residual_concentration must be positive.")
++        if self.residual_base not in {"uniform", "tree_distance"}:
++            raise ValueError("residual_base must be 'uniform' or 'tree_distance'.")
++        if self.tree_distance_decay <= 0:
++            raise ValueError("tree_distance_decay must be positive.")
++        if len(self.mixture_presence_prior) != 2 or min(self.mixture_presence_prior) <= 0:
++            raise ValueError("mixture_presence_prior must contain two positive values.")
++
++
+ @dataclass(frozen=True, slots=True)
+ class TrackingConfig:
+     """Control which sampler quantities are retained.
+ 
+-    Large cell-by-mutation or genotype traces are disabled by default. ``every``
+-    counts completed Gibbs iterations and must be positive.
+-
+-    Use :meth:`posterior` when coherent posterior cell-genotype and partition
+-    summaries will be required after fitting.
++    Large traces are disabled by default. Mixture diagnostics are independently
++    selectable. :meth:`posterior` tracks the coherent cell-clone, genotype, and
++    BCR-partition states needed for posterior cell summaries.
+     """
+ 
+     log_likelihood: bool = True
+@@ -21,6 +53,13 @@
+     cell_clone_assignments: bool = True
+     genotype_state: bool = False
+     observation_probabilities: bool = False
++    dominant_clones: bool = False
++    clone_proportions: bool = False
++    admixture_mass: bool = False
++    mixture_active: bool = False
++    effective_clone_counts: bool = False
++    admixture_entropy: bool = False
++    dominant_fraction: bool = False
+     every: int = 1
+ 
+     def __post_init__(self) -> None:
+@@ -33,6 +72,7 @@
+         *,
+         every: int = 1,
+         observation_probabilities: bool = False,
++        mixture_diagnostics: bool = False,
+     ) -> "TrackingConfig":
+         """Return a configuration sufficient for coherent posterior summaries."""
+ 
+@@ -43,51 +83,28 @@
+             cell_clone_assignments=True,
+             genotype_state=True,
+             observation_probabilities=observation_probabilities,
++            dominant_clones=mixture_diagnostics,
++            clone_proportions=mixture_diagnostics,
++            admixture_mass=mixture_diagnostics,
++            mixture_active=mixture_diagnostics,
++            effective_clone_counts=mixture_diagnostics,
++            admixture_entropy=mixture_diagnostics,
++            dominant_fraction=mixture_diagnostics,
+             every=every,
+         )
+ 
+ 
+ LocalAssignmentSampler = Literal["none", "approximate", "sequential"]
+-AnchorStrategy = Literal["uniform_pair", "adaptive"]
++AnchorStrategy = Literal["uniform_pair", "adaptive", "mutation_discordance"]
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class SplitMergeConfig:
+-    """Configuration for collapsed restricted-Gibbs split/merge updates.
++    """Configuration for the retained v0.2 split/merge transition.
+ 
+-    Parameters
+-    ----------
+-    proposals_per_sweep:
+-        Number of global proposals following the optional local assignment move.
+-    local_sampler:
+-        Local transition run before global proposals.
+-    cache_sufficient_statistics:
+-        Reuse clone likelihoods and per-cluster BCR/mutation statistics across
+-        proposals in the same sweep. This changes computation only, not the
+-        target distribution or random-number stream.
+-    anchor_strategy:
+-        ``"uniform_pair"`` preserves the 0.2.0 proposal. ``"adaptive"`` selects
+-        split and merge anchors separately and adapts their mixture probability.
+-        The state-dependent anchor probability is included in the MH ratio.
+-    initial_split_probability:
+-        Initial probability of requesting a split under adaptive scheduling.
+-    adaptation_interval:
+-        Number of adaptive proposals between Robbins-Monro updates.
+-    adaptation_step:
+-        Step size on the logit split probability. The sign balances accepted
+-        split and merge moves in the preceding window.
+-    min_split_probability, max_split_probability:
+-        Bounds preventing either move family from being starved.
+-    adapt_until:
+-        Optional maximum total split/merge attempt count for adaptation. ``None``
+-        keeps adaptation active. Fixing this after burn-in is recommended for
+-        formal posterior sampling.
+-    max_restricted_cells:
+-        Optional upper bound on the number of cells touched by a global split or
+-        merge proposal. With ``anchor_strategy="uniform_pair"``, anchors are
+-        sampled uniformly from the eligible cell pairs and the corresponding
+-        state-dependent proposal probability is included in the MH ratio. This
+-        prevents unexpectedly expensive restricted-Gibbs proposals.
++    The extra v0.3-era fields are retained only so trusted v0.3 checkpoints can
++    be decoded and rejected with a clear lineage error. The v0.4 runtime does
++    not implement mutation-informed or hybrid partition kernels.
+     """
+ 
+     proposals_per_sweep: int = 1
+@@ -101,6 +118,9 @@
+     max_split_probability: float = 0.9
+     adapt_until: int | None = None
+     max_restricted_cells: int | None = None
++    discordance_size_power: float = 0.5
++    discordance_epsilon: float = 1e-8
++    merge_similarity_strength: float = 2.0
+ 
+     def __post_init__(self) -> None:
+         if self.proposals_per_sweep < 1:
+@@ -123,9 +143,7 @@
+         if self.min_split_probability >= self.max_split_probability:
+             raise ValueError("min_split_probability must be below max_split_probability.")
+         if not self.min_split_probability <= self.initial_split_probability <= self.max_split_probability:
+-            raise ValueError(
+-                "initial_split_probability must lie between the configured bounds."
+-            )
++            raise ValueError("initial_split_probability must lie between the configured bounds.")
+         if self.adaptation_interval < 1:
+             raise ValueError("adaptation_interval must be at least 1.")
+         if self.adaptation_step <= 0:
+@@ -139,3 +157,42 @@
+                 raise ValueError(
+                     "max_restricted_cells currently requires anchor_strategy='uniform_pair'."
+                 )
++        if self.discordance_size_power < 0:
++            raise ValueError("discordance_size_power must be nonnegative.")
++        if self.discordance_epsilon <= 0:
++            raise ValueError("discordance_epsilon must be positive.")
++        if self.merge_similarity_strength < 0:
++            raise ValueError("merge_similarity_strength must be nonnegative.")
++
++
++# Decode-only v0.3 checkpoint classes. They are intentionally not exported.
++@dataclass(frozen=True, slots=True)
++class BlockMoveConfig:
++    proposals_per_sweep: int = 2
++    subset_strategy: str = "restricted_gibbs"
++    max_block_cells: int = 200
++    min_block_cells: int = 2
++    initial_split_off_probability: float = 0.5
++    adaptation_interval: int = 25
++    adaptation_step: float = 0.25
++    min_split_off_probability: float = 0.1
++    max_split_off_probability: float = 0.9
++    adapt_until: int | None = None
++    source_size_power: float = 0.5
++    discordance_epsilon: float = 1e-8
++    destination_similarity_strength: float = 2.0
++    bernoulli_intercept: float = -1.5
++    bernoulli_temperature: float = 1.0
++    block_size_geometric_p: float = 0.35
++    restricted_gibbs_temperature: float = 1.0
++
++
++@dataclass(frozen=True, slots=True)
++class HybridSamplerConfig:
++    initial_approximate_fraction: float = 0.30
++    adaptation_fraction: float = 0.75
++    warmup_approximate_every_initial: int = 1
++    warmup_approximate_every_late: int = 5
++    retention_approximate_every: int = 5
++    warmup_split_merge_every: int = 5
++    retention_split_merge_every: int = 10
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/src/cactri/state.py /mnt/data/Cactri-v0.4.0/src/cactri/state.py
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/src/cactri/state.py	2026-07-31 16:29:02.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/src/cactri/state.py	2026-08-01 07:23:20.074254530 +0000
+@@ -20,6 +20,13 @@
+         "assignments": "assignments_",
+         "bcr_profiles": "bcr_profiles_",
+         "hypercluster_to_clone": "hypercluster_to_clone_",
++        "dominant_clones": "dominant_clones_",
++        "hypercluster_clone_proportions": "hypercluster_clone_proportions_",
++        "cell_clone_assignments": "cell_clone_assignments_",
++        "admixture_mass": "admixture_mass_",
++        "residual_clone_proportions": "residual_clone_proportions_",
++        "mixture_active": "mixture_active_",
++        "mixture_presence_rate": "mixture_presence_rate_",
+         "p_obs_by_mutation": "p_obs_by_mutation_",
+         "p_unobs": "p_unobs_",
+         "alpha": "alpha_",
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/src/cactri/tree.py /mnt/data/Cactri-v0.4.0/src/cactri/tree.py
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/src/cactri/tree.py	2026-07-31 18:41:47.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/src/cactri/tree.py	2026-08-01 07:23:32.078254924 +0000
+@@ -121,6 +121,44 @@
+         super().__init__(n_clones=self.n_leaf_clones + 1, **kwargs)
+         self.mutation_profile_trace_ = self.genotype_state_trace_
+ 
++    def _tree_distance_residual_weights(self, dominant: int) -> np.ndarray:
++        """Return an unnormalized tree-distance base over non-dominant clones."""
++
++        weights = np.zeros(self.n_clones, dtype=float)
++        first_leaf = 2**self.n_levels - 1
++
++        def node_distance(left: int, right: int) -> int:
++            ancestors: dict[int, int] = {}
++            node = left
++            distance = 0
++            while True:
++                ancestors[node] = distance
++                if node == 0:
++                    break
++                node = (node - 1) // 2
++                distance += 1
++            node = right
++            distance = 0
++            while node not in ancestors:
++                node = (node - 1) // 2
++                distance += 1
++            return distance + ancestors[node]
++
++        for clone in range(self.n_clones):
++            if clone == dominant:
++                continue
++            if clone == 0 or dominant == 0:
++                distance = self.n_levels + 1
++            else:
++                distance = node_distance(
++                    first_leaf + dominant - 1,
++                    first_leaf + clone - 1,
++                )
++            weights[clone] = math.exp(
++                -self.clone_mixture.tree_distance_decay * float(distance)
++            )
++        return weights
++
+     def _make_base_edge_prior(self) -> np.ndarray:
+         if self.tree_prior == "uniform":
+             return np.full(self.n_tree_vertices, 1.0 / self.n_tree_vertices, dtype=float)
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/tests/test_public_api.py /mnt/data/Cactri-v0.4.0/tests/test_public_api.py
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/tests/test_public_api.py	2026-07-31 16:41:52.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/tests/test_public_api.py	2026-08-01 07:30:50.950269333 +0000
+@@ -3,7 +3,7 @@
+ import numpy as np
+ import pytest
+ 
+-from cactri import BCRInitializer, Cactri, CactriOmega, CactriTree, SplitMergeConfig, TrackingConfig
++from cactri import BCRInitializer, Cactri, CactriOmega, CactriTree, CloneMixtureConfig, SplitMergeConfig, TrackingConfig
+ 
+ 
+ def test_public_imports_and_abstract_base():
+@@ -11,6 +11,7 @@
+     with pytest.raises(TypeError):
+         Cactri(n_clones=2)
+     assert TrackingConfig().every == 1
++    assert CloneMixtureConfig().enabled is False
+     assert BCRInitializer is not None
+     assert CactriTree is not None
+     assert CactriOmega is not None
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/tests/test_v040_clone_mixture.py /mnt/data/Cactri-v0.4.0/tests/test_v040_clone_mixture.py
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/tests/test_v040_clone_mixture.py	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/tests/test_v040_clone_mixture.py	2026-08-01 07:29:07.174265926 +0000
+@@ -0,0 +1,351 @@
++from __future__ import annotations
++
++import gzip
++import math
++import pickle
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from cactri import (
++    Cactri,
++    CactriOmega,
++    CactriTree,
++    CloneMixtureConfig,
++    TrackingConfig,
++)
++
++
++def data(seed: int = 17, n: int = 36, m: int = 7, length: int = 6):
++    rng = np.random.default_rng(seed)
++    seq = rng.integers(0, 4, size=(n, length), dtype=np.int64)
++    total = rng.poisson(4.0, size=(n, m)).astype(np.int64)
++    latent = rng.integers(0, 3, size=n)
++    genotype = rng.integers(0, 2, size=(3, m))
++    probability = np.where(genotype[latent] == 1, 0.45, 0.01)
++    alt = rng.binomial(total, probability).astype(np.int64)
++    return seq, alt, total
++
++
++def make_omega(backend: str = "numpy", seed: int = 91) -> CactriOmega:
++    seq, alt, total = data()
++    model = CactriOmega(
++        n_clones=4,
++        clone_mixture=CloneMixtureConfig(enabled=True),
++        accelerator=backend,
++        random_state=seed,
++    )
++    model.prefit(seq, alt, total, init="random", random_init_clusters=4)
++    return model
++
++
++def make_tree(backend: str = "numpy", seed: int = 92) -> CactriTree:
++    seq, alt, total = data(seed=18)
++    model = CactriTree(
++        n_levels=2,
++        clone_mixture=CloneMixtureConfig(enabled=True),
++        accelerator=backend,
++        random_state=seed,
++    )
++    model.prefit(seq, alt, total, init="random", random_init_clusters=4)
++    return model
++
++
++def test_clone_mixture_config_validation():
++    assert not CloneMixtureConfig().enabled
++    assert CloneMixtureConfig(enabled=True).admixture_mass_prior == (1.0, 19.0)
++    with pytest.raises(ValueError):
++        CloneMixtureConfig(residual_concentration=0.0)
++    with pytest.raises(ValueError):
++        CloneMixtureConfig(admixture_mass_prior=(1.0, 0.0))
++    with pytest.raises(ValueError):
++        CloneMixtureConfig(residual_base="bad")  # type: ignore[arg-type]
++
++
++def test_disabled_mode_has_exact_v02_state_representation():
++    seq, alt, total = data()
++    model = CactriOmega(n_clones=4, random_state=4, accelerator="numpy")
++    model.prefit(seq, alt, total, init="random", random_init_clusters=4)
++    expected = model.hypercluster_to_clone_[model.assignments_]
++    np.testing.assert_array_equal(model.cell_clone_assignments_, expected)
++    np.testing.assert_array_equal(model.current_cell_clone_assignment(), expected)
++    np.testing.assert_allclose(model.hypercluster_clone_proportions_.sum(axis=1), 1.0)
++    assert not model.mixture_active_.any()
++    assert model.mixture_presence_rate_ == 0.0
++
++
++def test_exact_zero_pure_formulation_is_finite_and_normalized():
++    model = make_omega()
++    assert not model.mixture_active_.any()
++    proportions = model.hypercluster_clone_proportions_
++    assert np.all((proportions == 0.0) | (proportions == 1.0))
++    np.testing.assert_allclose(proportions.sum(axis=1), 1.0)
++    assert np.isfinite(model.log_likelihood())
++    assert np.isfinite(model.log_posterior())
++    probability = model.current_state_cell_clone_probabilities()
++    assert np.isfinite(probability).all()
++    np.testing.assert_allclose(probability.sum(axis=1), 1.0)
++
++
++def test_collapsed_active_mass_matches_manual_beta_dirichlet_integral():
++    model = make_omega()
++    counts = np.array([8, 2, 1, 0], dtype=np.int64)
++    dominant = 0
++    actual = model._collapsed_active_mixture_log_mass(counts, dominant)
++    a, b = model.clone_mixture.admixture_mass_prior
++    n_dom = counts[dominant]
++    n_other = counts.sum() - n_dom
++    expected = model._log_beta_function(a + n_other, b + n_dom)
++    expected -= model._log_beta_function(a, b)
++    mask = np.arange(model.n_clones) != dominant
++    alpha = (
++        model.clone_mixture.residual_concentration
++        * model._residual_base_weights(dominant)[mask]
++    )
++    residual = counts[mask]
++    expected += math.lgamma(alpha.sum()) - math.lgamma(
++        alpha.sum() + residual.sum()
++    )
++    expected += sum(
++        math.lgamma(x + n) - math.lgamma(x)
++        for x, n in zip(alpha, residual, strict=True)
++    )
++    assert actual == pytest.approx(expected)
++
++
++def test_mixture_cell_update_and_marginal_assignment_scores_are_normalized():
++    model = make_omega()
++    model.mixture_active_[:] = True
++    model.admixture_mass_[:] = 0.1
++    model.hypercluster_clone_proportions_[:] = 0.1 / (model.n_clones - 1)
++    model.hypercluster_clone_proportions_[
++        np.arange(model.n_hyperclusters), model.dominant_clones_
++    ] = 0.9
++    model._sample_cell_clone_assignments()
++    assert model.cell_clone_assignments_.shape == (model.n_cells,)
++    marginal = model._cell_hypercluster_mut_loglikelihood()
++    assert marginal.shape == (model.n_cells, model.n_hyperclusters)
++    assert np.isfinite(marginal).all()
++
++
++def test_mixture_tracking_and_posterior_summaries_include_clone_coclustering():
++    model = make_tree()
++    tracking = TrackingConfig.posterior(every=1, mixture_diagnostics=True)
++    model.fit(6, tracking=tracking)
++    assert len(model.dominant_clone_trace_) == 6
++    assert len(model.hypercluster_clone_proportions_trace_) == 6
++    cell_co = model.posterior_cell_clone_coassignment()
++    np.testing.assert_allclose(cell_co, cell_co.T)
++    np.testing.assert_allclose(np.diag(cell_co), 1.0)
++    assert model.posterior_hypercluster_clone_proportions().shape == (
++        model.n_hyperclusters,
++        model.n_clones,
++    )
++    assert model.posterior_dominant_clone_probabilities().shape == (
++        model.n_hyperclusters,
++        model.n_clones,
++    )
++    assert model.posterior_admixture_probabilities().shape == (
++        model.n_hyperclusters,
++    )
++    assert model.posterior_effective_clone_counts().shape == (
++        model.n_hyperclusters,
++    )
++
++
++def test_tree_distance_residual_base_prefers_nearby_leaves():
++    seq, alt, total = data(n=20)
++    model = CactriTree(
++        n_levels=2,
++        clone_mixture=CloneMixtureConfig(
++            enabled=True,
++            residual_base="tree_distance",
++            tree_distance_decay=1.0,
++        ),
++        random_state=1,
++        accelerator="numpy",
++    )
++    model.prefit(seq, alt, total, init="random", random_init_clusters=3)
++    weights = model._residual_base_weights(1)
++    assert weights[1] == 0.0
++    assert weights[2] > weights[3]
++    assert weights[2] > weights[0]
++    np.testing.assert_allclose(weights.sum(), 1.0)
++
++
++def test_tree_distance_residual_base_is_rejected_for_omega():
++    seq, alt, total = data(n=20)
++    model = CactriOmega(
++        n_clones=4,
++        clone_mixture=CloneMixtureConfig(
++            enabled=True, residual_base="tree_distance"
++        ),
++        random_state=1,
++    )
++    with pytest.raises(ValueError, match="CactriTree"):
++        model.prefit(seq, alt, total)
++
++
++def test_mixture_checkpoint_resume_is_exact(tmp_path: Path):
++    tracking = TrackingConfig.posterior(mixture_diagnostics=True)
++    uninterrupted = make_omega(seed=120)
++    uninterrupted.fit(8, tracking=tracking)
++
++    partial = make_omega(seed=120)
++    partial.fit(3, tracking=tracking)
++    path = partial.save_checkpoint(tmp_path / "mixture.cactri.gz")
++    resumed = CactriOmega.load_checkpoint(path)
++    resumed.fit(5, tracking=tracking)
++
++    for name in (
++        "assignments_",
++        "cell_clone_assignments_",
++        "dominant_clones_",
++        "hypercluster_clone_proportions_",
++        "mixture_active_",
++        "genotype_matrix_",
++        "p_obs_by_mutation_",
++    ):
++        np.testing.assert_array_equal(getattr(resumed, name), getattr(uninterrupted, name))
++    assert resumed.p_unobs_ == uninterrupted.p_unobs_
++    assert resumed.mixture_presence_rate_ == uninterrupted.mixture_presence_rate_
++    np.testing.assert_array_equal(
++        resumed.cell_clone_assignment_trace_, uninterrupted.cell_clone_assignment_trace_
++    )
++
++
++def test_v02_checkpoint_state_migrates_to_exact_pure_mixture(tmp_path: Path):
++    model = make_omega()
++    model.clone_mixture = CloneMixtureConfig(enabled=False)
++    for name in (
++        "cell_clone_assignments_",
++        "hypercluster_clone_proportions_",
++        "admixture_mass_",
++        "residual_clone_proportions_",
++        "mixture_active_",
++        "mixture_presence_rate_",
++    ):
++        delattr(model, name)
++    payload = {
++        "format": "cactri-checkpoint",
++        "format_version": 1,
++        "package_version": "0.2.2",
++        "model": model,
++    }
++    path = tmp_path / "old.cactri.gz"
++    with gzip.open(path, "wb") as handle:
++        pickle.dump(payload, handle)
++    loaded = Cactri.load_checkpoint(path)
++    assert not loaded.clone_mixture.enabled
++    np.testing.assert_array_equal(
++        loaded.cell_clone_assignments_,
++        loaded.hypercluster_to_clone_[loaded.assignments_],
++    )
++    assert not loaded.mixture_active_.any()
++    np.testing.assert_allclose(
++        loaded.hypercluster_clone_proportions_.sum(axis=1), 1.0
++    )
++
++
++def test_v03_checkpoint_is_rejected_with_lineage_error(tmp_path: Path):
++    model = make_omega()
++    payload = {
++        "format": "cactri-checkpoint",
++        "format_version": 1,
++        "package_version": "0.3.1",
++        "model": model,
++    }
++    path = tmp_path / "v03.cactri.gz"
++    with gzip.open(path, "wb") as handle:
++        pickle.dump(payload, handle)
++    with pytest.raises(ValueError, match="discontinued experimental"):
++        Cactri.load_checkpoint(path)
++
++
++@pytest.mark.parametrize("factory", [make_omega, make_tree])
++def test_complete_mixture_chain_numpy_numba_identity(factory):
++    numpy_model = factory("numpy", seed=222)
++    numba_model = factory("numba", seed=222)
++    tracking = TrackingConfig.posterior(mixture_diagnostics=True)
++    numpy_model.fit(7, tracking=tracking)
++    numba_model.fit(7, tracking=tracking)
++    for name in (
++        "assignments_",
++        "cell_clone_assignments_",
++        "dominant_clones_",
++        "hypercluster_clone_proportions_",
++        "admixture_mass_",
++        "residual_clone_proportions_",
++        "mixture_active_",
++        "p_obs_by_mutation_",
++        "cell_clone_assignment_trace_",
++        "genotype_state_trace_",
++    ):
++        np.testing.assert_array_equal(
++            np.asarray(getattr(numpy_model, name), dtype=object),
++            np.asarray(getattr(numba_model, name), dtype=object),
++        )
++    assert numpy_model.p_unobs_ == numba_model.p_unobs_
++    assert numpy_model.mixture_presence_rate_ == numba_model.mixture_presence_rate_
++
++
++def test_pure_and_admixed_structure_transitions_are_numerically_safe():
++    model = make_omega(seed=331)
++    model.mixture_presence_rate_ = 1.0 - model.eps
++    model._sample_clone_mixture_state()
++    assert model.mixture_active_.all()
++    np.testing.assert_allclose(model.hypercluster_clone_proportions_.sum(axis=1), 1.0)
++    assert np.all(model.hypercluster_clone_proportions_ > 0.0)
++
++    model.cell_clone_assignments_ = model.dominant_clones_[model.assignments_].copy()
++    model.mixture_presence_rate_ = model.eps
++    model._sample_clone_mixture_state()
++    assert not model.mixture_active_.any()
++    assert np.all(
++        (model.hypercluster_clone_proportions_ == 0.0)
++        | (model.hypercluster_clone_proportions_ == 1.0)
++    )
++    assert np.isfinite(model.log_posterior())
++
++
++def test_sequential_assignment_keeps_mixture_state_shapes_consistent():
++    model = make_omega(seed=442)
++    model.fit(4, assignment_sampler="sequential")
++    assert model.dominant_clones_.shape == (model.n_hyperclusters,)
++    assert model.hypercluster_clone_proportions_.shape == (
++        model.n_hyperclusters,
++        model.n_clones,
++    )
++    assert model.admixture_mass_.shape == (model.n_hyperclusters,)
++    np.testing.assert_allclose(
++        model.hypercluster_clone_proportions_.sum(axis=1), 1.0
++    )
++
++
++def test_split_merge_is_explicitly_unavailable_for_clone_mixtures():
++    model = make_omega()
++    with pytest.raises(ValueError, match="not defined for clone mixtures"):
++        model.fit(1, assignment_sampler="split_merge")
++
++
++def test_alpha_sampling_defaults_follow_mixture_opt_in():
++    seq, alt, total = data()
++    legacy = CactriOmega(n_clones=4, random_state=3)
++    legacy.prefit(seq, alt, total)
++    assert not legacy.sample_alpha
++    original = legacy.alpha_
++    legacy.fit(3)
++    assert legacy.alpha_ == original
++
++    mixture = CactriOmega(
++        n_clones=4,
++        clone_mixture=CloneMixtureConfig(enabled=True),
++        random_state=3,
++    )
++    mixture.prefit(seq, alt, total)
++    assert mixture.sample_alpha
++    original = mixture.alpha_
++    mixture.fit(3)
++    assert mixture.alpha_ != original
++    assert mixture.alpha_ > 0.0
+diff -ruN '--exclude=dist' '--exclude=*.patch' '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=*.egg-info' /mnt/data/_extract_v022/Cactri-v0.2.2/validation.json /mnt/data/Cactri-v0.4.0/validation.json
+--- /mnt/data/_extract_v022/Cactri-v0.2.2/validation.json	2026-07-31 18:51:56.000000000 +0000
++++ /mnt/data/Cactri-v0.4.0/validation.json	2026-08-01 07:36:00.806279506 +0000
+@@ -1,21 +1,65 @@
+ {
+-  "version": "0.2.2",
+-  "tests_passed": 42,
+-  "tests_failed": 0,
+-  "wheel": "dist/cactri-0.2.2-py3-none-any.whl",
+-  "clean_install": true,
+-  "features": [
+-    "probabilistic observed mutation-edge posterior",
+-    "learned direct-vs-distance-smoothed reliability mixture",
+-    "bounded MH-correct split/merge anchors"
+-  ],
+-  "algorithmic_identity": {
+-    "probabilistic_tree_numpy_numba": true,
+-    "randomness_source": "NumPy Generator with shared pre-generated draws"
++  "release": "0.4.0",
++  "lineage": {
++    "base": "0.2.2",
++    "discontinued_branch": [
++      "0.3.0",
++      "0.3.1"
++    ]
+   },
+-  "benchmark_characterization": {
+-    "dataset": "K4B level 2 msp 0.01",
+-    "schedule": "10 warmup + 1 bounded split/merge + 5 retained",
+-    "metrics_exact_vs_benchmark_subclass": true
+-  }
+-}
+\ No newline at end of file
++  "date": "2026-08-01",
++  "environment": {
++    "python": "3.13.5",
++    "numpy": "2.3.5",
++    "numba_available": true,
++    "numba": "0.65.1",
++    "platform": "Linux-6.12.13-x86_64-with-glibc2.41"
++  },
++  "tests": {
++    "pytest": {
++      "passed": 59,
++      "failed": 0
++    },
++    "legacy_v022_characterization": {
++      "omega_approximate_exact": true,
++      "tree_approximate_exact": true,
++      "omega_split_merge_exact": true
++    },
++    "numpy_numba_identity": {
++      "omega_mixture_full_chain_exact": true,
++      "tree_mixture_full_chain_exact": true
++    },
++    "checkpoint": {
++      "mixture_resume_exact": true,
++      "actual_v022_omega_resume_exact": true,
++      "actual_v022_tree_resume_exact": true,
++      "actual_v031_rejected_with_lineage_error": true
++    },
++    "numerical": {
++      "exact_zero_pure_state_finite": true,
++      "mixture_rows_normalized": true,
++      "collapsed_beta_dirichlet_formula_checked": true,
++      "sequential_mixture_state_shapes_checked": true,
++      "tree_distance_residual_prior_checked": true
++    },
++    "clean_wheel_smoke": {
++      "passed": true,
++      "models": [
++        "CactriTree",
++        "CactriOmega"
++      ],
++      "checkpoint_roundtrip": true
++    }
++  },
++  "artifacts": {
++    "wheel": "cactri-0.4.0-py3-none-any.whl",
++    "wheel_sha256": "18a9aeed567c9e4eaf38fd319b2102e2b462e1a9b5a1576077342c1fcc7bb67d",
++    "wheel_bytes": 69308
++  },
++  "notes": [
++    "Clone mixtures are disabled by default.",
++    "sample_alpha defaults off in legacy mode and on in mixture mode.",
++    "v0.3.x checkpoints are intentionally rejected.",
++    "No simulation-performance benchmark was run in this implementation phase."
++  ]
++}

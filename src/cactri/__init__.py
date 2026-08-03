@@ -2,7 +2,7 @@
 
 from .base import Cactri
 from .bcr_initializer import BCRInitializer
-from .config import SplitMergeConfig, TrackingConfig
+from .config import CloneMixtureConfig, SplitMergeConfig, TrackingConfig
 from .omega import CactriOmega
 from .tree import CactriTree
 
@@ -12,7 +12,8 @@ __all__ = [
     "CactriOmega",
     "BCRInitializer",
     "TrackingConfig",
+    "CloneMixtureConfig",
     "SplitMergeConfig",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.4.1"

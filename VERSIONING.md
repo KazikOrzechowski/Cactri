@@ -1,19 +1,31 @@
 # Versioning and release policy
 
-Cactri follows semantic versioning.
+Cactri follows semantic versioning and immutable release artifacts.
 
-- **Patch release (`0.2.x`)**: bug fixes, documentation, and optimizations that
-  do not intentionally change the target statistical model.
-- **Minor release (`0.x.0`)**: new samplers, changed defaults, or additive model
-  capabilities. Migration notes and characterization tests are required.
-- **Major release (`x.0.0`)**: removal of deprecated public APIs or incompatible
-  result-schema changes.
+## Lineage
 
-A release is immutable after publication. Development for the next release is
-performed in a copied source tree, and every release must include:
+```text
+0.2.2 ───────────────► 0.4.0
+   \
+    └──► 0.3.0 ─► 0.3.1  [experimental, discontinued]
+```
 
-1. a changelog entry;
-2. migration notes for changed defaults or semantics;
-3. unit and backend-identity tests;
-4. a clean-install wheel smoke test;
-5. a machine-readable validation report.
+The 0.3 branch tested mutation-informed partition proposals. Simulation
+benchmarking found no improvement and zero accepted split-off moves across the
+main diagnostic. Future work therefore returned to 0.2.2 and changed the
+within-hypercluster clone model instead.
+
+## Release classes
+
+- Patch: bug fixes and computational changes that preserve the statistical
+  model.
+- Minor: additive models, new samplers, or changed opt-in semantics.
+- Major: removal of deprecated APIs or incompatible result schemas.
+
+Every release includes a changelog, migration guide, backend-identity tests,
+clean-install wheel test, validation report, source archive, and wheel.
+
+## 0.4.0
+
+Opt-in cell-level clone mixtures within BCR hyperclusters. Legacy behavior is
+unchanged by default. v0.3 checkpoints are not part of this lineage.

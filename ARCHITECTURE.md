@@ -1,63 +1,76 @@
 # Architecture
 
-## Shared model
+## Release lineage
 
-`Cactri` is abstract. It owns:
+Cactri 0.4.0 branches from 0.2.2. The 0.3.x hybrid/blocked partition samplers
+are retained only as immutable historical artifacts.
 
-- BCR sequence coercion and Dirichlet profiles;
-- CRP cell-to-hypercluster assignments;
-- hypercluster-to-clone assignments;
-- approximate, sequential, and collapsed restricted-Gibbs split/merge samplers;
-- mutation read likelihoods through a common binary genotype-matrix interface;
-- `p_obs_by_mutation` and `p_unobs` initialization and Gibbs updates;
-- coherent trace-based posterior summaries;
-- tracking, validation, and legacy result aliases.
+## Public classes
 
-Subclasses implement genotype state initialization, sampling, prior evaluation,
-and optional prior-hyperparameter updates.
+- `Cactri`: abstract shared CRP/BCR, observation, clone-mixture, tracking, and
+  checkpoint implementation.
+- `CactriTree`: full-binary-tree mutation-origin genotype model.
+- `CactriOmega`: independent clone-by-mutation genotype model.
+- `BCRInitializer`: standalone BCR-only initializer and consensus fitter.
 
-## Stage-2 split/merge transition
+## Shared latent state
 
-For a proposed partition, the transition analytically integrates out:
+Legacy state:
 
-1. BCR frequency profiles under the Dirichlet-multinomial model;
-2. each hypercluster's clone label under the clone prior and mutation-read
-   likelihood.
+- `assignments_`: cell to BCR hypercluster.
+- `bcr_profiles_`: hypercluster by BCR-position categorical probabilities.
+- `p_obs_by_mutation_` and `p_unobs_`.
 
-A split proposal anchors two cells in separate candidate groups and assigns the
-remaining cells with restricted Gibbs probabilities containing:
+Mixture state:
 
-- the CRP group-size factor;
-- the BCR posterior predictive probability;
-- the clone-marginal mutation posterior predictive probability.
+- `dominant_clones_` / `hypercluster_to_clone_`: dominant clone per
+  hypercluster.
+- `cell_clone_assignments_`: cell-level mutation clone labels.
+- `hypercluster_clone_proportions_`: hypercluster by clone mixture matrix.
+- `admixture_mass_`: total residual mass per hypercluster.
+- `residual_clone_proportions_`: residual distribution conditional on not being
+  the dominant clone.
+- `mixture_active_`: pure-versus-admixed indicator.
+- `mixture_presence_rate_`: global admixture prevalence.
 
-The reverse split probability is evaluated for merge proposals, yielding a
-Metropolis-Hastings transition with an explicit proposal correction. After an
-accepted move, explicit BCR profiles and clone labels are sampled from their
-conditional distributions.
+When mixtures are disabled, these arrays are maintained as an exact one-hot
+view of the v0.2 state without consuming random numbers.
 
-## Tree model
+## Transition order
 
-`CactriTree` represents each mutation by one full-binary-tree origin vertex. A
-supplied mutation-edge assignment enables a learned distance-aware mismatch
-rate by default. Uniform and level-inverse base priors remain available.
+Mixture-enabled iterations use:
 
-## Omega model
+1. approximate or sequential cell-to-hypercluster transition;
+2. conjugate BCR-profile refresh performed by the assignment transition;
+3. exact parallel cell-level clone sampling;
+4. collapsed pure/admixed and dominant-clone sampling;
+5. conjugate admixture-parameter sampling;
+6. Tree edge or Omega genotype update from counts aggregated by cell clone;
+7. genotype-prior hyperparameter update;
+8. observation-probability update;
+9. optional CRP concentration update.
 
-`CactriOmega` samples clone-by-mutation entries independently. A supplied
-`omega_prior` enables a learned matrix mismatch rate. `fix_reference_clone`
-retains the previous clone-0 behavior.
+Legacy mode retains the exact 0.2.2 transition order.
 
-## Acceleration and algorithmic identity
+## Partial collapsing
 
-`_numba_accelerator.py` contains all optional kernels. Random values are always
-created by the model's NumPy `Generator` and passed to the backend. Kernels do
-not call a random-number generator. The split/merge transition is implemented
-in shared deterministic NumPy/Python code and therefore follows the same RNG
-stream under both backends.
+The hypercluster assignment score marginalizes over the destination clone
+mixture. Cell clone labels are then sampled conditionally. Dominant clone and
+pure/admixed structure are sampled with admixture mass and residual proportions
+integrated out. This avoids creating a new BCR component merely to explain
+mutation-clone heterogeneity.
 
-## Compatibility
+## Accelerators
 
-Canonical model data are ordinary attributes. `state_` is a thin compatibility
-view, and result dictionaries retain previous aliases such as
-`mutation_profile`, `genotype_matrix`, and `cell_clone_assignments`.
+NumPy owns the RNG. Numba kernels receive explicit uniforms and do not create
+hidden random state. Mixture-specific categorical draws use the same shared row
+sampler, preserving exact backend identity.
+
+## Tracking
+
+`TrackingConfig` controls every potentially large mixture trace independently.
+Hypercluster-level posterior summaries align each draw to the current partition
+by maximum cell overlap. Cell clone co-clustering is computed directly from
+cell-level label traces and is invariant to clone-label permutations only when
+the biological clone labels themselves are considered fixed; the coassignment
+matrix is invariant to numeric relabeling.
