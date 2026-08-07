@@ -16,9 +16,9 @@ from typing import Any, Literal
 
 import numpy as np
 
-from .omega import CactriOmega
-from .tree import CactriTree
-from .utils.validation import normalize_dirichlet_prior
+from cactri.omega import CactriOmega
+from cactri.tree import CactriTree
+from cactri.utils.validation import normalize_dirichlet_prior
 
 ModelKind = Literal["tree", "omega"]
 
