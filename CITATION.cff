@@ -1,0 +1,7 @@
+cff-version: 1.2.0
+message: "If you use Cactri, please cite this software."
+title: "Cactri"
+version: 0.4.3
+date-released: 2026-08-13
+license: GPL-3.0-only
+type: software

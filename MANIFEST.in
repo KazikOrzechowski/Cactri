@@ -1,0 +1,9 @@
+include CHANGELOG.md
+include CITATION.cff
+include RELEASE_NOTES_0.4.3.md
+include ARCHITECTURE.md
+include CHECKPOINTS.md
+include CLONE_MIXTURES.md
+include MIGRATION.md
+include validation.json
+recursive-include docs *.md *.json

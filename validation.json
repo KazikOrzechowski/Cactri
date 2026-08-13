@@ -1,0 +1,16 @@
+{
+  "version": "0.4.3",
+  "release_date": "2026-08-13",
+  "tests_passed": 61,
+  "source_test": "passed",
+  "wheel_test_suite": "61 passed",
+  "wheel_import_smoke_test": "passed",
+  "sdist_install_smoke_test": "passed",
+  "status": "release validation passed",
+  "scope": [
+    "release hygiene only",
+    "no intentional statistical-model or sampler changes",
+    "ACT and ACT initializer excluded",
+    "pruning/refinement utilities canonicalized in cactri.pruning"
+  ]
+}
