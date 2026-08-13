@@ -1,9 +1,0 @@
-{
-  "version": "0.4.1",
-  "tests_passed": 61,
-  "status": "technical validation passed; statistical benchmark incomplete",
-  "fixes": [
-    "lazy coassignment output",
-    "strictly positive active residual simplex"
-  ]
-}
